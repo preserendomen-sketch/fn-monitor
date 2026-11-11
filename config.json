@@ -91,6 +91,13 @@
         "offset": -8
       },
       {
+        "id": "USOUSD",
+        "symbol": "USOUSD",
+        "source": "yahoo",
+        "ticker": "CL=F",
+        "offset": 0
+      },
+      {
         "id": "BTCUSD",
         "symbol": "BTCUSD",
         "source": "binance",

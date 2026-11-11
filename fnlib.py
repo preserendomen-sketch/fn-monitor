@@ -670,7 +670,11 @@ def fmt_price(value: float | None, instrument: dict[str, Any] | None = None) -> 
     symbol = (instrument or {}).get("symbol", "")
     if any(x in symbol for x in ("BTC", "NAS", "US30", "GER", "NDX", "DAX")):
         return f"{value:.1f}"
-    if any(x in symbol for x in ("XAU", "GOLD")) or (instrument or {}).get("ticker") == "GC=F":
+    ticker = (instrument or {}).get("ticker") or ""
+    if any(x in symbol for x in ("XAU", "GOLD")) or ticker == "GC=F":
+        return f"{value:.2f}"
+    # WTI is quoted in cents. Keep two decimals even if the price is under 50.
+    if symbol in {"USOUSD", "CL"} or ticker == "CL=F" or "WTI" in symbol:
         return f"{value:.2f}"
     if value is not None and abs(value) >= 50:
         return f"{value:.2f}"

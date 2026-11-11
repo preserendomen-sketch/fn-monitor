@@ -5,7 +5,7 @@ Monitor čakajočih nalogov in skener priložnosti, ki tečeta na GitHub Actions
 ## Kaj počne
 
 - **Monitor** (`monitor.py`) vsakih 60 sekund preveri čakajoče naloge in pošlje webhook ob dogodkih `near_entry`, `triggered`, `m15_close_against`, `near_sl`, `sl_hit`, `tp_hit` in `halfway_to_tp`.
-- **Skener** (`scanner.py`) vsakih 5 minut pregleda devet simbolov (EURUSD, GBPUSD, AUDUSD, USDJPY, XAUUSD, BTCUSD, NAS100, GER40, US30) in javi kandidate `breakout`, `retest` in `exhaustion`.
+- **Skener** (`scanner.py`) vsakih 5 minut pregleda deset simbolov (EURUSD, GBPUSD, AUDUSD, USDJPY, XAUUSD, USOUSD, BTCUSD, NAS100, GER40, US30) in javi kandidate `breakout`, `retest` in `exhaustion`. USOUSD je surova nafta WTI.
 - Oba tečeta v istem zagonu približno 25 minut. Razpored je na vsakih 30 minut ob delavnikih, približno od 07:00 do 21:00 po času Europe/Ljubljana. Cron je v UTC (pozimi UTC+1, torej 06:00–20:00 UTC). Poleti, ko je Ljubljana UTC+2, isto okno pade približno eno uro pozneje. Zamuda načrtovanega zagona je v redu.
 - Stanje (že poslani dogodki, cooldowni, dnevne omejitve) se med zagoni shrani v predpomnilnik Actions, da se isto opozorilo ne pošlje dvakrat. Skener sme na dan poslati največ **2 kandidata na simbol** in **8 skupaj**.
 - BTCUSD je samo v skenerju. Med nalogi ga ni, ker ga je posrednik zavrnil.

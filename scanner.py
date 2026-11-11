@@ -126,10 +126,17 @@ def h1_closes_asof(h1: list[dict[str, Any]], asof_ts: float) -> list[float]:
 
 
 def uses_atr_buffer(inst: dict[str, Any]) -> bool:
-    """FX and cash DAX have no usable volume, so breakouts need an ATR cushion."""
+    """Breakouts on these markets must close 0.15× H1 ATR beyond the level.
+
+    FX and cash DAX have no usable volume. WTI (USOUSD / CL=F) does, and it
+    still uses the same cushion so a one-tick poke through the level is not
+    a breakout.
+    """
     symbol = (inst.get("symbol") or inst.get("id") or "").upper()
     ticker = inst.get("ticker") or ""
-    if symbol in {"EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "GER40"}:
+    if symbol in {"EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "GER40", "USOUSD"}:
+        return True
+    if ticker == "CL=F":
         return True
     return ticker.endswith("=X")
 
@@ -146,7 +153,7 @@ def levels_broken_before(
     """PDH/PDL or Asian range levels that were closed beyond on an earlier bar today.
 
     Returns list of (name, price, break_dir) where break_dir is 'up' or 'down'.
-    `buffer` is 0.15× H1 ATR for FX/GER40, otherwise 0.
+    `buffer` is 0.15× H1 ATR for FX, GER40 and WTI, otherwise 0.
     """
     today = local_dt(m15[idx]["ts"]).date()
     start, _ = day_bounds(today)
@@ -243,7 +250,7 @@ def evaluate_bar(
             "note": note,
         }
 
-    # H1 ATR as of this M15 close, for the no-volume cushion.
+    # H1 ATR as of this M15 close, for the close-beyond-level cushion.
     h1_asof = [b for b in h1 if b["ts"] + 3600 <= bar["ts"] + 15 * 60 + 1]
     h1_atr = atr(h1_asof, 14)
     atr_mult = float(sc.get("atr_buffer_mult") or 0.15)
