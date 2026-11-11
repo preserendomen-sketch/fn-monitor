@@ -72,6 +72,7 @@ def scanner_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
     sc.setdefault("news_cache_seconds", 3600)
     sc.setdefault("news_url", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
     sc.setdefault("m5_confirm", True)
+    sc.setdefault("max_signal_age_minutes", 45)
     if not sc.get("universe"):
         raise SystemExit("config.json nima scanner.universe")
     for inst in sc["universe"]:
@@ -830,51 +831,61 @@ def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], se
             continue
         if not m15:
             continue
-        bar = m15[-1]
-        idx = len(m15) - 1
-        close_ts = bar["ts"] + 15 * 60
+        newest = m15[-1]
         prev = last_processed.get(inst["id"])
         m5n = "ni" if m5 is None else str(len(m5))
         # First run: remember the last completed bar and do not back-send it.
         if prev is None:
-            last_processed[inst["id"]] = bar["ts"]
+            last_processed[inst["id"]] = newest["ts"]
             log(
-                f"{inst['symbol']} broker={fmt_price(bar['close'], inst)} "
+                f"{inst['symbol']} broker={fmt_price(newest['close'], inst)} "
                 f"M15={len(m15)} H1={len(h1)} M5={m5n} (začetno stanje, brez pošiljanja)"
             )
             continue
-        last_processed[inst["id"]] = bar["ts"]
-        if bar["ts"] <= float(prev):
+        pending = [(i, b) for i, b in enumerate(m15) if b["ts"] > float(prev)]
+        pending.sort(key=lambda item: item[1]["ts"])
+        if not pending:
             continue
-        if not in_active_hours(close_ts, sc["active_start"], sc["active_end"], sc["weekdays_only"]):
-            continue
-        cands = evaluate_bar(inst, m15, idx, h1, sc, m5=m5, daily=daily, news=news)
-        seen = set()
-        for cand in cands:
-            if cand["type"] in seen:
+        max_age = float(sc.get("max_signal_age_minutes") or 45) * 60.0
+        now = time.time()
+        for idx, bar in pending:
+            close_ts = bar["ts"] + 15 * 60
+            last_processed[inst["id"]] = bar["ts"]
+            if not in_active_hours(close_ts, sc["active_start"], sc["active_end"], sc["weekdays_only"]):
                 continue
-            seen.add(cand["type"])
-            if not can_send(state, inst, cand["type"], bar["ts"], sc):
-                log(
-                    f"{inst['symbol']} {cand['type']} {cand['direction']} "
-                    f"zavrnjen (cooldown ali dnevni cap)."
-                )
-                continue
-            if send:
-                ok, detail = send_webhook(cfg, {k: v for k, v in cand.items() if k != "bar_ts"})
-                if detail == SKIPPED_MISSING_SECRETS:
+            cands = evaluate_bar(inst, m15, idx, h1, sc, m5=m5, daily=daily, news=news)
+            stale = (now - close_ts) > max_age
+            seen = set()
+            for cand in cands:
+                if cand["type"] in seen:
                     continue
-                log(
-                    f"WEBHOOK candidate {inst['symbol']} {cand['type']} "
-                    f"{cand['direction']} -> {'OK' if ok else 'NAPAKA'}: {detail}"
-                )
-                if not ok:
+                seen.add(cand["type"])
+                if stale:
+                    log(
+                        f"{inst['symbol']} {cand['type']} {cand['direction']} "
+                        f"zamujen (sveča starejša od {int(max_age // 60)} min)."
+                    )
                     continue
-            mark_sent(state, inst, cand["type"], bar["ts"])
-            fired.append(cand)
-        last = m15[-1]
+                if not can_send(state, inst, cand["type"], bar["ts"], sc):
+                    log(
+                        f"{inst['symbol']} {cand['type']} {cand['direction']} "
+                        f"zavrnjen (cooldown ali dnevni cap)."
+                    )
+                    continue
+                if send:
+                    ok, detail = send_webhook(cfg, {k: v for k, v in cand.items() if k != "bar_ts"})
+                    if detail == SKIPPED_MISSING_SECRETS:
+                        continue
+                    log(
+                        f"WEBHOOK candidate {inst['symbol']} {cand['type']} "
+                        f"{cand['direction']} -> {'OK' if ok else 'NAPAKA'}: {detail}"
+                    )
+                    if not ok:
+                        continue
+                mark_sent(state, inst, cand["type"], bar["ts"])
+                fired.append(cand)
         log(
-            f"{inst['symbol']} broker={fmt_price(last['close'], inst)} "
+            f"{inst['symbol']} broker={fmt_price(newest['close'], inst)} "
             f"M15={len(m15)} H1={len(h1)} M5={m5n}"
         )
         time.sleep(0.2)

@@ -5,9 +5,9 @@
 set -u
 cd "$(dirname "$0")"
 
-MINUTES="${1:-25}"
+MINUTES="${1:-28}"
 if [ -z "${MINUTES}" ]; then
-  MINUTES=25
+  MINUTES=28
 fi
 if ! [[ "$MINUTES" =~ ^[0-9]+$ ]] || [ "$MINUTES" -lt 1 ] || [ "$MINUTES" -gt 30 ]; then
   echo "Trajanje mora biti med 1 in 30 minutami." >&2

@@ -1,21 +1,22 @@
 name: Monitor
 
 # Cron is UTC and cannot follow DST. Europe/Ljubljana is UTC+1 in winter
-# (this schedule) and UTC+2 in summer. Weekday runs start every 30 minutes
-# from 06:00 UTC through 20:00 UTC, which is about 07:00–21:00 in Ljubljana
-# while the winter offset is in effect. In summer the same crons land about
-# an hour later locally. Each run loops for ~25 minutes. Scheduled runs may
-# start late; gaps are acceptable because state is restored from cache.
+# and UTC+2 in summer. Every 15 minutes from 06:00 through 20:45 UTC is
+# about 07:00–21:45 Ljubljana in winter (08:00–22:45 in summer).
+# Each run loops for 28 minutes, so it is still going when the next cron
+# fires. cancel-in-progress is false: the running job is not killed, and the
+# newest waiting run starts when it exits. An intermediate queued run can be
+# replaced, but the 28-minute job already covers that slot. If GitHub starts
+# a cron late, the scanner still emits M15 signals that closed within 45 minutes.
 on:
   schedule:
-    - cron: "*/30 6-19 * * 1-5"
-    - cron: "0 20 * * 1-5"
+    - cron: "*/15 6-20 * * 1-5"
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: "Trajanje v minutah (1–30, privzeto 25)"
+        description: "Trajanje v minutah (1–30, privzeto 28)"
         required: false
-        default: "25"
+        default: "28"
 
 permissions:
   contents: read
@@ -70,7 +71,7 @@ jobs:
         env:
           FN_WEBHOOK_URL: ${{ secrets.FN_WEBHOOK_URL }}
           FN_WEBHOOK_KEY: ${{ secrets.FN_WEBHOOK_KEY }}
-          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '25' }}
+          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '28' }}
           PYTHONUNBUFFERED: "1"
         run: bash run_session.sh "$DURATION_MINUTES"
 
