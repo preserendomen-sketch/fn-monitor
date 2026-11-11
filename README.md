@@ -51,7 +51,7 @@ Naslednji načrtovani ali ročni zagon prebere novo datoteko. V `config.json` ne
 Skener lahko teče pri tebi, neprekinjeno, namesto na GitHub Actions. Program sam pošilja samo ob delavnikih od 08:00 do 21:00 po času Europe/Ljubljana, zato je opravilo lahko zagnano ob prijavi in lahko ostane odprto.
 
 1. Namesti Python 3.12 in odpri mapo repozitorija v ukazni vrstici.
-2. Ustvari okolje in namesti odvisnosti:
+2. Ustvari okolje in namesti odvisnosti. `tzdata` je v `requirements.txt` in je na Windowsu potreben za časovni pas `Europe/Ljubljana`:
 
    ```
    py -3.12 -m venv .venv
@@ -69,3 +69,4 @@ Skener lahko teče pri tebi, neprekinjeno, namesto na GitHub Actions. Program sa
    - Arguments: `scanner.py`
    - Start in: mapa repozitorija
 5. V zavihku **Conditions** izklopi zagon samo ob napajanju iz elektrike, če je računalnik prenosnik. Opravilo naj teče z uporabnikom, ki ima nastavljeni spremenljivki, in samo kadar je ta uporabnik prijavljen, da ju Python vidi.
+6. Okno oddaljenega namizja zapri z **Disconnect** (križec na vrhu), ne z **Sign out**. Odjava ustavi opravilo ob prijavi, prekinitev povezave pa ga pusti teči.
