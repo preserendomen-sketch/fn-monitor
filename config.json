@@ -1,0 +1,125 @@
+{
+  "webhook_url_env": "FN_WEBHOOK_URL",
+  "webhook_key_env": "FN_WEBHOOK_KEY",
+  "key_header": "Authorization",
+  "key_prefix": "Bearer ",
+  "poll_seconds": 60,
+  "cooldown_seconds": 600,
+  "orders": [
+    {
+      "id": "EURUSD",
+      "symbol": "EURUSD",
+      "source": "yahoo",
+      "ticker": "EURUSD=X",
+      "offset": 0,
+      "side": "sell",
+      "entry": 1.1155,
+      "sl": 1.1175,
+      "tp": 1.1115
+    },
+    {
+      "id": "AUDUSD",
+      "symbol": "AUDUSD",
+      "source": "yahoo",
+      "ticker": "AUDUSD=X",
+      "offset": 0,
+      "side": "sell",
+      "entry": 0.688,
+      "sl": 0.6894,
+      "tp": 0.6847
+    },
+    {
+      "id": "XAUUSD",
+      "symbol": "XAUUSD",
+      "source": "yahoo",
+      "ticker": "GC=F",
+      "offset": -8,
+      "side": "sell",
+      "entry": 4060,
+      "sl": 4072,
+      "tp": 4036
+    }
+  ],
+  "scanner": {
+    "interval_seconds": 300,
+    "timezone": "Europe/Ljubljana",
+    "active_start": "08:00",
+    "active_end": "21:00",
+    "weekdays_only": true,
+    "asian_start": "00:00",
+    "asian_end": "08:00",
+    "cooldown_minutes": 90,
+    "max_alerts_per_day": 8,
+    "rvol_min": 1.5,
+    "rsi_ob": 75,
+    "rsi_os": 25,
+    "wick_frac": 0.5,
+    "universe": [
+      {
+        "id": "EURUSD",
+        "symbol": "EURUSD",
+        "source": "yahoo",
+        "ticker": "EURUSD=X",
+        "offset": 0
+      },
+      {
+        "id": "GBPUSD",
+        "symbol": "GBPUSD",
+        "source": "yahoo",
+        "ticker": "GBPUSD=X",
+        "offset": 0
+      },
+      {
+        "id": "AUDUSD",
+        "symbol": "AUDUSD",
+        "source": "yahoo",
+        "ticker": "AUDUSD=X",
+        "offset": 0
+      },
+      {
+        "id": "USDJPY",
+        "symbol": "USDJPY",
+        "source": "yahoo",
+        "ticker": "USDJPY=X",
+        "offset": 0
+      },
+      {
+        "id": "XAUUSD",
+        "symbol": "XAUUSD",
+        "source": "yahoo",
+        "ticker": "GC=F",
+        "offset": -8
+      },
+      {
+        "id": "BTCUSD",
+        "symbol": "BTCUSD",
+        "source": "binance",
+        "ticker": "BTCUSDT",
+        "offset": 0
+      },
+      {
+        "id": "NAS100",
+        "symbol": "NAS100",
+        "source": "yahoo",
+        "ticker": "NQ=F",
+        "offset": -100
+      },
+      {
+        "id": "GER40",
+        "symbol": "GER40",
+        "source": "yahoo",
+        "ticker": "^GDAXI",
+        "offset": -26
+      },
+      {
+        "id": "US30",
+        "symbol": "US30",
+        "source": "yahoo",
+        "ticker": "YM=F",
+        "offset": -86
+      }
+    ],
+    "max_alerts_per_symbol_per_day": 2,
+    "atr_buffer_mult": 0.15
+  }
+}

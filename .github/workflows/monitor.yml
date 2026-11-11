@@ -1,0 +1,84 @@
+name: Monitor
+
+# Cron is UTC and cannot follow DST. Europe/Ljubljana is UTC+1 in winter
+# (this schedule) and UTC+2 in summer. Weekday runs start every 30 minutes
+# from 06:00 UTC through 20:00 UTC, which is about 07:00–21:00 in Ljubljana
+# while the winter offset is in effect. In summer the same crons land about
+# an hour later locally. Each run loops for ~25 minutes. Scheduled runs may
+# start late; gaps are acceptable because state is restored from cache.
+on:
+  schedule:
+    - cron: "*/30 6-19 * * 1-5"
+    - cron: "0 20 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Trajanje v minutah (1–30, privzeto 25)"
+        required: false
+        default: "25"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: fn-price-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Namesti odvisnosti
+        run: python -m pip install -r requirements.txt
+
+      - name: Obnovi stanje
+        id: state-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            state.json
+            scanner_state.json
+          # Unique key so every run saves a new snapshot. restore-keys picks
+          # up the newest previous snapshot, which keeps one-shot events,
+          # cooldowns, and the scanner daily caps across runs.
+          key: fn-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fn-state-
+
+      - name: Pripravi datoteke stanja
+        run: |
+          if [ -n "${{ steps.state-cache.outputs.cache-matched-key }}" ]; then
+            echo "Stanje obnovljeno iz ${{ steps.state-cache.outputs.cache-matched-key }}"
+          else
+            echo "Ni prejšnjega stanja (prvi tek ali predpomnilnik je potekel)."
+          fi
+          test -f state.json || echo '{}' > state.json
+          test -f scanner_state.json || echo '{}' > scanner_state.json
+
+      - name: Zaženi monitor in skener
+        env:
+          FN_WEBHOOK_URL: ${{ secrets.FN_WEBHOOK_URL }}
+          FN_WEBHOOK_KEY: ${{ secrets.FN_WEBHOOK_KEY }}
+          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '25' }}
+          PYTHONUNBUFFERED: "1"
+        run: bash run_session.sh "$DURATION_MINUTES"
+
+      - name: Shrani stanje
+        if: always() && steps.state-cache.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            state.json
+            scanner_state.json
+          key: ${{ steps.state-cache.outputs.cache-primary-key }}

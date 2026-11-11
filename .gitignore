@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+state.json
+scanner_state.json
+backfill_report.json
+*.tmp
