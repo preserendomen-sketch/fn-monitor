@@ -5,41 +5,7 @@
   "key_prefix": "Bearer ",
   "poll_seconds": 60,
   "cooldown_seconds": 600,
-  "orders": [
-    {
-      "id": "EURUSD",
-      "symbol": "EURUSD",
-      "source": "yahoo",
-      "ticker": "EURUSD=X",
-      "offset": 0,
-      "side": "sell",
-      "entry": 1.1155,
-      "sl": 1.1175,
-      "tp": 1.1115
-    },
-    {
-      "id": "AUDUSD",
-      "symbol": "AUDUSD",
-      "source": "yahoo",
-      "ticker": "AUDUSD=X",
-      "offset": 0,
-      "side": "sell",
-      "entry": 0.688,
-      "sl": 0.6894,
-      "tp": 0.6847
-    },
-    {
-      "id": "XAUUSD",
-      "symbol": "XAUUSD",
-      "source": "yahoo",
-      "ticker": "GC=F",
-      "offset": -8,
-      "side": "sell",
-      "entry": 4060,
-      "sl": 4072,
-      "tp": 4036
-    }
-  ],
+  "orders": [],
   "scanner": {
     "interval_seconds": 300,
     "timezone": "Europe/Ljubljana",

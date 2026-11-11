@@ -70,8 +70,6 @@ EVENT_NOTES = {
 
 def prepare_orders(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     orders = cfg.get("orders") or []
-    if not orders:
-        raise SystemExit("config.json nima nobenega naloga v polju 'orders'.")
     for order in orders:
         order.setdefault("id", order.get("symbol"))
         order.setdefault("offset", 0)
@@ -260,8 +258,12 @@ def status_line(snapshots: list[tuple[dict[str, Any], dict[str, Any] | None, str
 
 
 def poll_once(cfg: dict[str, Any], all_state: dict[str, Any]) -> None:
+    orders = prepare_orders(cfg)
+    if not orders:
+        log("Ni čakajočih nalogov.")
+        return
     snapshots: list[tuple[dict[str, Any], dict[str, Any] | None, str]] = []
-    for order in prepare_orders(cfg):
+    for order in orders:
         try:
             market = last_price_snapshot(order)
             evaluate_order(cfg, order, market, all_state)
@@ -282,9 +284,12 @@ def poll_once(cfg: dict[str, Any], all_state: dict[str, Any]) -> None:
 
 
 def run_test(cfg: dict[str, Any]) -> int:
+    orders = prepare_orders(cfg)
+    if not orders:
+        log("Ni čakajočih nalogov. Testni alarm ni poslan.")
+        return 0
     if not webhook_key(cfg) or not webhook_url(cfg):
         log("Opozorilo: FN_WEBHOOK_URL ali FN_WEBHOOK_KEY manjka.")
-    orders = prepare_orders(cfg)
     order = orders[0]
     try:
         market = last_price_snapshot(order)
@@ -325,7 +330,7 @@ def main() -> int:
     install_stop_signals()
     try:
         cfg = load_config()
-        prepare_orders(cfg)
+        orders = prepare_orders(cfg)
     except (OSError, json.JSONDecodeError, SystemExit) as exc:
         log(f"config.json ni veljaven: {exc}")
         return 2
@@ -340,7 +345,7 @@ def main() -> int:
     if not (webhook_url(cfg) and webhook_key(cfg)):
         log("Opozorilo: FN_WEBHOOK_URL ali FN_WEBHOOK_KEY manjka. Pošiljanje bo preskočeno.")
     log(
-        f"Monitor zagnan. Nalogov: {len(cfg['orders'])}. "
+        f"Monitor zagnan. Nalogov: {len(orders)}. "
         f"Interval: {cfg.get('poll_seconds', 60)} s. "
         f"cffi={'da' if fnlib._have_curl_cffi() else 'ne'}. "
         f"Webhook: {'da' if webhook_url(cfg) and webhook_key(cfg) else 'ne'}. "

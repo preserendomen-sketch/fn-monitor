@@ -28,7 +28,7 @@ Webhook naslov in ključ ne sodita v git. Dodaj ju kot skrivnosti repozitorija:
 
 ## Urejanje nalogov
 
-Aktivni nalogi so v datoteki `config.json`, v polju `orders`. Trenutno so trije: EURUSD, AUDUSD in XAUUSD (vsi `sell`). BTCUSD v to polje ne dodajaj. V `scanner.universe` BTCUSD ostane.
+Aktivni nalogi so v datoteki `config.json`, v polju `orders`. Trenutno je seznam prazen. BTCUSD v to polje ne dodajaj. V `scanner.universe` BTCUSD ostane.
 
 Urejanje prek spletnega vmesnika GitHub:
 
