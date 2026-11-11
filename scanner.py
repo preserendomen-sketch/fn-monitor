@@ -15,7 +15,7 @@ import os
 import sys
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import fnlib
@@ -24,6 +24,8 @@ from fnlib import (
     FetchError,
     atr,
     day_bounds,
+    ema_last,
+    ema_series,
     ema_state,
     fetch_candles,
     fmt_price,
@@ -65,6 +67,11 @@ def scanner_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
     sc.setdefault("rsi_ob", 75)
     sc.setdefault("rsi_os", 25)
     sc.setdefault("wick_frac", 0.5)
+    sc.setdefault("pullback_vwap_atr", 1.5)
+    sc.setdefault("news_window_minutes", 30)
+    sc.setdefault("news_cache_seconds", 3600)
+    sc.setdefault("news_url", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+    sc.setdefault("m5_confirm", True)
     if not sc.get("universe"):
         raise SystemExit("config.json nima scanner.universe")
     for inst in sc["universe"]:
@@ -189,12 +196,272 @@ def is_rejection(bar: dict[str, Any], direction: str, wick_frac: float) -> bool:
     return upper >= wick_frac and bar["close"] <= mid
 
 
+# High-impact currencies that move each instrument. Override with
+# scanner.news_currencies in config.json.
+DEFAULT_NEWS_CCY: dict[str, tuple[str, ...]] = {
+    "EURUSD": ("USD", "EUR"),
+    "GBPUSD": ("USD", "GBP"),
+    "AUDUSD": ("USD", "AUD"),
+    "USDJPY": ("USD", "JPY"),
+    "XAUUSD": ("USD",),
+    "BTCUSD": ("USD",),
+    "NAS100": ("USD",),
+    "US30": ("USD",),
+    "USOUSD": ("USD",),
+    "GER40": ("EUR", "USD"),
+}
+
+_news_cache: dict[str, Any] = {"fetched_at": 0.0, "ok": False, "events": []}
+
+
+def _num(value: float | None, digits: int = 6) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
+def instrument_currencies(symbol: str, sc: dict[str, Any]) -> set[str]:
+    custom = sc.get("news_currencies") or {}
+    if symbol in custom:
+        return {str(c).upper() for c in custom[symbol]}
+    return {c.upper() for c in DEFAULT_NEWS_CCY.get(symbol.upper(), ())}
+
+
+def load_news_calendar(sc: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    """ForexFactory week file, cached for news_cache_seconds (default 1 hour).
+
+    A failed fetch is cached too, so one outage does not suppress signals.
+    """
+    now = time.time()
+    ttl = float(sc.get("news_cache_seconds") or 3600)
+    if _news_cache["fetched_at"] and (now - float(_news_cache["fetched_at"])) < ttl:
+        return list(_news_cache["events"]), bool(_news_cache["ok"])
+    url = str(sc.get("news_url") or "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+    try:
+        payload = fnlib.http_get_json(url, timeout=15, retries=2)
+        if not isinstance(payload, list):
+            raise FetchError("koledar ni seznam")
+        events = [ev for ev in payload if isinstance(ev, dict)]
+        ok = True
+    except Exception as exc:
+        log(f"Koledar ni na voljo ({str(exc).replace(chr(10), ' ')[:160]}).")
+        events = []
+        ok = False
+    _news_cache["fetched_at"] = now
+    _news_cache["ok"] = ok
+    _news_cache["events"] = events
+    return events, ok
+
+
+def high_impact_block(
+    symbol: str,
+    when_ts: float,
+    events: list[dict[str, Any]],
+    sc: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Nearest high-impact event within ±news_window_minutes, or None."""
+    window = float(sc.get("news_window_minutes") or 30) * 60.0
+    currencies = instrument_currencies(symbol, sc)
+    best: dict[str, Any] | None = None
+    best_delta: float | None = None
+    for ev in events:
+        if str(ev.get("impact") or "").lower() != "high":
+            continue
+        country = str(ev.get("country") or "").upper()
+        if country not in currencies:
+            continue
+        raw_date = ev.get("date")
+        if not raw_date:
+            continue
+        try:
+            ev_ts = datetime.fromisoformat(str(raw_date)).timestamp()
+        except ValueError:
+            continue
+        delta = abs(when_ts - ev_ts)
+        if delta <= window and (best_delta is None or delta < best_delta):
+            best = ev
+            best_delta = delta
+    return best
+
+
+def exhaustion_allowed(direction: str, trend: str) -> bool:
+    """Drop exhaustion that fights a clear H1 trend.
+
+    A sell is suppressed in a bullish trend and a buy in a bearish trend.
+    Flat and unknown trends still pass.
+    """
+    if direction == "sell" and trend == "bullish":
+        return False
+    if direction == "buy" and trend == "bearish":
+        return False
+    return True
+
+
+def touches_from_trend_side(bar: dict[str, Any], level: float | None, direction: str) -> bool:
+    """Wick tags the level from the trend side and the close finishes back beyond it.
+
+    The open has to be on the trend side of the level, so a bar that starts
+    through the EMA and only closes back does not count.
+    """
+    if level is None:
+        return False
+    if direction == "buy":
+        return bar["open"] >= level and bar["low"] <= level and bar["close"] > level
+    return bar["open"] <= level and bar["high"] >= level and bar["close"] < level
+
+
+def m5_confirmation(bar: dict[str, Any], direction: str, m5: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Latest completed M5 inside the M15 bar.
+
+    None for m5_confirm means the feed did not cover this bar. False means a
+    bar was available and did not confirm.
+    """
+    empty = {"m5_confirm": None, "m5_high": None, "m5_low": None, "m5_trigger": None}
+    if not m5:
+        return empty
+    start = float(bar["ts"])
+    end = start + 15 * 60
+    inside = [(i, b) for i, b in enumerate(m5) if start - 1 <= b["ts"] < end - 1]
+    if not inside:
+        return empty
+    i, last = inside[-1]
+    closes = [b["close"] for b in m5[: i + 1]]
+    e9 = ema_last(closes, 9)
+    e20 = ema_last(closes, 20)
+    mid = (bar["high"] + bar["low"]) / 2.0
+    if direction == "buy":
+        ok = last["close"] > mid and e9 is not None and e20 is not None and e9 > e20
+        trigger = last["high"]
+    else:
+        ok = last["close"] < mid and e9 is not None and e20 is not None and e9 < e20
+        trigger = last["low"]
+    return {
+        "m5_confirm": bool(ok),
+        "m5_high": last["high"],
+        "m5_low": last["low"],
+        "m5_trigger": trigger,
+    }
+
+
+def prior_week_high_low(
+    daily: list[dict[str, Any]] | None,
+    asof_ts: float,
+) -> tuple[float | None, float | None]:
+    """Prior Mon–Sun high and low from daily bars. Does not look at the current week."""
+    if not daily:
+        return None, None
+    asof = local_dt(asof_ts).date()
+    this_monday = asof - timedelta(days=asof.weekday())
+    prev_monday = this_monday - timedelta(days=7)
+    highs: list[float] = []
+    lows: list[float] = []
+    for bar in daily:
+        day = datetime.fromtimestamp(bar["ts"], tz=timezone.utc).date()
+        if prev_monday <= day < this_monday:
+            highs.append(bar["high"])
+            lows.append(bar["low"])
+    if not highs:
+        return None, None
+    return max(highs), min(lows)
+
+
+def round_step_for(inst: dict[str, Any], sc: dict[str, Any]) -> float:
+    steps = sc.get("round_steps") or {}
+    symbol = (inst.get("symbol") or "").upper()
+    if symbol in steps:
+        return float(steps[symbol])
+    defaults = {
+        "EURUSD": 0.005,
+        "GBPUSD": 0.005,
+        "AUDUSD": 0.005,
+        "USDJPY": 0.5,
+        "XAUUSD": 10.0,
+        "BTCUSD": 1000.0,
+        "NAS100": 100.0,
+        "US30": 100.0,
+        "GER40": 100.0,
+        "USOUSD": 1.0,
+    }
+    return float(defaults.get(symbol, 1.0))
+
+
+def nearest_round_distance(price: float, step: float) -> tuple[float, float]:
+    if step <= 0:
+        return 0.0, price
+    level = round(price / step) * step
+    return abs(price - level), level
+
+
+def recent_trading_days(n: int, today=None) -> set:
+    """The last n weekdays, including today when today is a weekday."""
+    if n < 1:
+        n = 1
+    day = today or datetime.now(LJ_TZ).date()
+    found = []
+    while len(found) < n:
+        if day.weekday() < 5:
+            found.append(day)
+        day -= timedelta(days=1)
+    return set(found)
+
+
+def _gate_candidates(
+    inst: dict[str, Any],
+    bar: dict[str, Any],
+    found: list[dict[str, Any]],
+    m5: list[dict[str, Any]] | None,
+    sc: dict[str, Any],
+    news: tuple[list[dict[str, Any]], bool] | None,
+) -> list[dict[str, Any]]:
+    """M5 confirmation for breakout/retest/pullback, then the news window."""
+    require_m5 = bool(sc.get("m5_confirm", True))
+    gated: list[dict[str, Any]] = []
+    for cand in found:
+        if cand["type"] in {"breakout", "retest", "pullback"}:
+            info = m5_confirmation(bar, cand["direction"], m5)
+            cand["m5_confirm"] = info["m5_confirm"]
+            cand["m5_high"] = _num(info["m5_high"])
+            cand["m5_low"] = _num(info["m5_low"])
+            cand["m5_trigger"] = _num(info["m5_trigger"])
+            if info["m5_confirm"] is None:
+                cand["note"] = f"{cand['note']} M5 potrditev ni na voljo".strip()
+            elif require_m5 and not info["m5_confirm"]:
+                continue
+        gated.append(cand)
+
+    if news is None:
+        events, ok = load_news_calendar(sc)
+    else:
+        events, ok = news
+    if not ok:
+        for cand in gated:
+            if "koledar ni na voljo" not in cand["note"]:
+                cand["note"] = f"{cand['note']} koledar ni na voljo".strip()
+        return gated
+
+    close_ts = bar["ts"] + 15 * 60
+    kept: list[dict[str, Any]] = []
+    for cand in gated:
+        blocked = high_impact_block(inst["symbol"], close_ts, events, sc)
+        if blocked is None:
+            kept.append(cand)
+            continue
+        log(
+            f"news_block {inst['symbol']} {cand['type']} {cand['direction']} "
+            f"{blocked.get('title')} {blocked.get('country')} {blocked.get('date')}"
+        )
+    return kept
+
+
 def evaluate_bar(
     inst: dict[str, Any],
     m15: list[dict[str, Any]],
     idx: int,
     h1: list[dict[str, Any]],
     sc: dict[str, Any],
+    m5: list[dict[str, Any]] | None = None,
+    daily: list[dict[str, Any]] | None = None,
+    news: tuple[list[dict[str, Any]], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Return zero or more candidate dicts for m15[idx] (must be completed)."""
     bar = m15[idx]
@@ -212,7 +479,11 @@ def evaluate_bar(
     rvol = relative_volume(m15, idx, 20)
     h1_closes = h1_closes_asof(h1, bar["ts"])
     trend = ema_state(h1_closes, 9, 20)
+    h1_ema20 = ema_last(h1_closes, 20)
+    m15_ema20 = ema_series(closes, 20)[idx]
     vwap = session_vwap([b for b in m15[: idx + 1] if start <= b["ts"] <= bar["ts"]])
+    pwh, pwl = prior_week_high_low(daily, bar["ts"])
+    round_dist, round_level = nearest_round_distance(bar["close"], round_step_for(inst, sc))
     wick_need = float(sc.get("wick_frac") or 0.5)
     rvol_min = float(sc.get("rvol_min") or 1.5)
     rsi_ob = float(sc.get("rsi_ob") or 75)
@@ -248,6 +519,12 @@ def evaluate_bar(
             ),
             "bar_ts": bar["ts"],
             "note": note,
+            "pwh": _num(pwh),
+            "pwl": _num(pwl),
+            "dist_pwh": None if pwh is None else _num(abs(bar["close"] - pwh)),
+            "dist_pwl": None if pwl is None else _num(abs(bar["close"] - pwl)),
+            "dist_round": _num(round_dist),
+            "round_level": _num(round_level),
         }
 
     # H1 ATR as of this M15 close, for the close-beyond-level cushion.
@@ -340,9 +617,55 @@ def evaluate_bar(
                 )
             )
 
+    # (b2) Pullback to M15 EMA20 or H1 EMA20 in a clear H1 trend.
+    pb_dir = None
+    if trend == "bullish" and h1_ema20 is not None and bar["close"] > h1_ema20:
+        pb_dir = "buy"
+    elif trend == "bearish" and h1_ema20 is not None and bar["close"] < h1_ema20:
+        pb_dir = "sell"
+    vwap_limit = float(sc.get("pullback_vwap_atr") or 1.5)
+    if (
+        pb_dir
+        and h1_atr
+        and h1_atr > 0
+        and vwap is not None
+        and is_rejection(bar, pb_dir, wick_need)
+    ):
+        touched_ema: list[tuple[str, float]] = []
+        m15_ema_prev = ema_series(closes, 20)[idx - 1] if idx else None
+        for ema_level in (m15_ema20, m15_ema_prev):
+            if touches_from_trend_side(bar, ema_level, pb_dir):
+                touched_ema.append(("M15 EMA20", float(ema_level)))
+                break
+        if touches_from_trend_side(bar, h1_ema20, pb_dir):
+            touched_ema.append(("H1 EMA20", float(h1_ema20)))
+        if touched_ema:
+            label, level = touched_ema[0]
+            if abs(level - vwap) <= vwap_limit * h1_atr:
+                found.append(
+                    pack(
+                        "pullback",
+                        pb_dir,
+                        level,
+                        (
+                            f"Pullback na {label} {fmt_price(level, inst)}, "
+                            f"H1 EMA 9/20 {trend}, rejection sveča, "
+                            f"razdalja do VWAP znotraj {vwap_limit:g}× H1 ATR."
+                        ),
+                    )
+                )
+
     # (c) Exhaustion rejection at PDH/PDL, RSI extreme, wick > 50%.
+    # Suppressed when the direction fights the H1 EMA 9/20 trend.
     upper, lower = wick_fractions(bar)
-    if pdh is not None and bar["high"] >= pdh and upper >= wick_need and rsi is not None and rsi > rsi_ob:
+    if (
+        pdh is not None
+        and bar["high"] >= pdh
+        and upper >= wick_need
+        and rsi is not None
+        and rsi > rsi_ob
+        and exhaustion_allowed("sell", trend)
+    ):
         found.append(
             pack(
                 "exhaustion",
@@ -351,7 +674,14 @@ def evaluate_bar(
                 f"Izčrpanost na PDH {fmt_price(pdh, inst)}, zgornji wick {upper:.0%}, RSI {rsi:.1f}.",
             )
         )
-    if pdl is not None and bar["low"] <= pdl and lower >= wick_need and rsi is not None and rsi < rsi_os:
+    if (
+        pdl is not None
+        and bar["low"] <= pdl
+        and lower >= wick_need
+        and rsi is not None
+        and rsi < rsi_os
+        and exhaustion_allowed("buy", trend)
+    ):
         found.append(
             pack(
                 "exhaustion",
@@ -361,7 +691,7 @@ def evaluate_bar(
             )
         )
 
-    return found
+    return _gate_candidates(inst, bar, found, m5, sc, news)
 
 
 def day_key(ts: float | None = None) -> str:
@@ -399,27 +729,47 @@ def mark_sent(state: dict[str, Any], inst: dict[str, Any], ctype: str, bar_ts: f
     state.setdefault("last", {})[f"{inst['id']}:{ctype}"] = bar_ts
 
 
-def fetch_instrument(inst: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _fetch_optional(inst: dict[str, Any], interval: str, range_: str) -> list[dict[str, Any]] | None:
+    try:
+        bars = completed(fetch_candles(inst, interval, range_))
+    except Exception as exc:
+        log(f"{inst.get('symbol', '?')} {interval}: ni podatka ({exc})")
+        return None
+    return bars
+
+
+def fetch_instrument(
+    inst: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
     m15 = completed(fetch_candles(inst, "15m", "1mo"))
     time.sleep(0.15)
     h1 = completed(fetch_candles(inst, "1h", "3mo"))
-    return m15, h1
+    time.sleep(0.15)
+    m5 = _fetch_optional(inst, "5m", "1mo")
+    time.sleep(0.1)
+    daily = _fetch_optional(inst, "1d", "6mo")
+    return m15, h1, m5, daily
 
 
-def backfill(cfg: dict[str, Any], sc: dict[str, Any]) -> list[dict[str, Any]]:
-    """Walk today's completed M15 bars in the active window and apply caps."""
-    today = datetime.now(LJ_TZ).date()
-    start_active = hm_on_day(today, sc["active_start"]).timestamp()
-    end_active = hm_on_day(today, sc["active_end"]).timestamp()
+def backfill(cfg: dict[str, Any], sc: dict[str, Any], days: int = 1) -> list[dict[str, Any]]:
+    """Walk completed M15 bars in the active window and apply caps.
+
+    `days` is the number of recent weekdays, including today. The default is
+    today only. No webhooks are sent.
+    """
+    wanted = recent_trading_days(days)
     now = time.time()
-    end = min(end_active, now)
     fake_state: dict[str, Any] = {"day": day_key(), "sent_today": 0, "sent_today_by_symbol": {}, "last": {}}
     flagged: list[dict[str, Any]] = []
+    news = load_news_calendar(sc)
 
     for inst in sc["universe"]:
         try:
-            m15, h1 = fetch_instrument(inst)
-            log(f"backfill {inst['symbol']}: M15={len(m15)} H1={len(h1)}")
+            m15, h1, m5, daily = fetch_instrument(inst)
+            log(
+                f"backfill {inst['symbol']}: M15={len(m15)} H1={len(h1)} "
+                f"M5={'ni' if m5 is None else len(m5)} D1={'ni' if daily is None else len(daily)}"
+            )
         except FetchError as exc:
             log(f"backfill {inst['symbol']}: ni podatka ({exc})")
             continue
@@ -429,11 +779,13 @@ def backfill(cfg: dict[str, Any], sc: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         for idx, bar in enumerate(m15):
             close_ts = bar["ts"] + 15 * 60
-            if close_ts < start_active or bar["ts"] >= end:
+            if close_ts > now + 2:
+                continue
+            if local_dt(bar["ts"]).date() not in wanted:
                 continue
             if not in_active_hours(close_ts, sc["active_start"], sc["active_end"], sc["weekdays_only"]):
                 continue
-            cands = evaluate_bar(inst, m15, idx, h1, sc)
+            cands = evaluate_bar(inst, m15, idx, h1, sc, m5=m5, daily=daily, news=news)
             seen = set()
             for cand in cands:
                 if cand["type"] in seen:
@@ -464,10 +816,11 @@ def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], se
         state["sent_today_by_symbol"] = {}
     fired: list[dict[str, Any]] = []
     last_processed = state.setdefault("last_processed", {})
+    news = load_news_calendar(sc)
 
     for inst in sc["universe"]:
         try:
-            m15, h1 = fetch_instrument(inst)
+            m15, h1, m5, daily = fetch_instrument(inst)
         except FetchError as exc:
             log(f"{inst['symbol']}: ni podatka ({exc})")
             continue
@@ -481,12 +834,13 @@ def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], se
         idx = len(m15) - 1
         close_ts = bar["ts"] + 15 * 60
         prev = last_processed.get(inst["id"])
+        m5n = "ni" if m5 is None else str(len(m5))
         # First run: remember the last completed bar and do not back-send it.
         if prev is None:
             last_processed[inst["id"]] = bar["ts"]
             log(
                 f"{inst['symbol']} broker={fmt_price(bar['close'], inst)} "
-                f"M15={len(m15)} H1={len(h1)} (začetno stanje, brez pošiljanja)"
+                f"M15={len(m15)} H1={len(h1)} M5={m5n} (začetno stanje, brez pošiljanja)"
             )
             continue
         last_processed[inst["id"]] = bar["ts"]
@@ -494,7 +848,7 @@ def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], se
             continue
         if not in_active_hours(close_ts, sc["active_start"], sc["active_end"], sc["weekdays_only"]):
             continue
-        cands = evaluate_bar(inst, m15, idx, h1, sc)
+        cands = evaluate_bar(inst, m15, idx, h1, sc, m5=m5, daily=daily, news=news)
         seen = set()
         for cand in cands:
             if cand["type"] in seen:
@@ -521,7 +875,7 @@ def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], se
         last = m15[-1]
         log(
             f"{inst['symbol']} broker={fmt_price(last['close'], inst)} "
-            f"M15={len(m15)} H1={len(h1)}"
+            f"M15={len(m15)} H1={len(h1)} M5={m5n}"
         )
         time.sleep(0.2)
     return fired
@@ -529,7 +883,8 @@ def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], se
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="FundedNext opportunity scanner")
-    parser.add_argument("--backfill", action="store_true", help="Preglej današnje M15 in izpiši kandidate, brez webhooka.")
+    parser.add_argument("--backfill", action="store_true", help="Preglej M15 in izpiši kandidate, brez webhooka.")
+    parser.add_argument("--days", type=int, default=1, help="Koliko zadnjih trgovalnih dni zajame --backfill.")
     parser.add_argument("--once", action="store_true", help="En krog in končaj (pošlje samo nove sveče).")
     parser.add_argument("--no-send", action="store_true", help="Ne pošiljaj webhookov.")
     args = parser.parse_args()
@@ -543,19 +898,28 @@ def main() -> int:
         return 2
 
     if args.backfill:
+        days = max(1, int(args.days or 1))
         log(
-            f"Backfill današnjih M15 (okno {sc['active_start']}-{sc['active_end']} "
+            f"Backfill zadnjih {days} trgovalnih dni "
+            f"(okno {sc['active_start']}-{sc['active_end']} "
             f"Europe/Ljubljana, cap {sc['max_alerts_per_day']}/dan, "
             f"{sc.get('max_alerts_per_symbol_per_day', 2)}/simbol, "
-            f"cooldown {sc['cooldown_minutes']} min)."
+            f"cooldown {sc['cooldown_minutes']} min). Brez webhooka."
         )
-        flagged = backfill(cfg, sc)
+        flagged = backfill(cfg, sc, days=days)
         sent_like = [c for c in flagged if not c.get("suppressed")]
         suppressed = [c for c in flagged if c.get("suppressed")]
+        def _by_type(rows: list[dict[str, Any]]) -> dict[str, int]:
+            counts: dict[str, int] = {}
+            for row in rows:
+                counts[row["type"]] = counts.get(row["type"], 0) + 1
+            return dict(sorted(counts.items()))
+
         log(
             f"BACKFILL: {len(flagged)} zadetkov filtrov, "
             f"{len(sent_like)} bi šlo ven po cap/cooldown, "
-            f"{len(suppressed)} bi bilo zadržanih."
+            f"{len(suppressed)} bi bilo zadržanih. "
+            f"Po tipu raw={_by_type(flagged)} po_cap={_by_type(sent_like)}."
         )
         for c in flagged:
             flag = "CAP" if c.get("suppressed") else "ALERT"

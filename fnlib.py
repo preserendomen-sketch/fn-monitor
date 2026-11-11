@@ -300,7 +300,7 @@ def yahoo_chart_url(ticker: str, interval: str, range_: str, host: str = "query1
 
 
 def interval_seconds(interval: str) -> int:
-    return {"1m": 60, "15m": 15 * 60, "1h": 3600, "60m": 3600, "1d": 86400}[interval]
+    return {"1m": 60, "5m": 300, "15m": 15 * 60, "1h": 3600, "60m": 3600, "1d": 86400}[interval]
 
 
 def _short_err(exc: BaseException) -> str:
@@ -338,7 +338,12 @@ def fetch_yahoo(ticker: str, interval: str, range_: str) -> list[dict[str, Any]]
     raise last_err
 
 
-def fetch_binance(ticker: str, interval: str, limit: int = 500) -> list[dict[str, Any]]:
+def fetch_binance(
+    ticker: str,
+    interval: str,
+    limit: int = 500,
+    end_time_ms: int | None = None,
+) -> list[dict[str, Any]]:
     """BTC klines. api.binance.com first, then the public vision mirror.
 
     GitHub-hosted runners often get HTTP 451 from api.binance.com. The vision
@@ -348,6 +353,8 @@ def fetch_binance(ticker: str, interval: str, limit: int = 500) -> list[dict[str
     hosts = ("api.binance.com", "data-api.binance.vision")
     for host in hosts:
         url = f"https://{host}/api/v3/klines?symbol={ticker}&interval={interval}&limit={limit}"
+        if end_time_ms is not None:
+            url += f"&endTime={int(end_time_ms)}"
         try:
             candles = parse_binance_klines(http_get_json(url))
         except FetchError as exc:
@@ -366,9 +373,19 @@ def fetch_candles(instrument: dict[str, Any], interval: str, range_: str = "5d")
     ticker = instrument["ticker"]
     offset = float(instrument.get("offset") or 0)
     if source == "binance":
-        binv = {"1m": "1m", "15m": "15m", "1h": "1h", "60m": "1h"}.get(interval, interval)
-        limit = 1000 if interval in ("15m", "1h", "60m") else 120
+        binv = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "60m": "1h", "1d": "1d"}.get(interval, interval)
+        limit = 1000 if interval in ("5m", "15m", "1h", "60m", "1d") else 120
         candles = fetch_binance(ticker, binv, limit=limit)
+        # 1000 M5 bars cover ~3.5 days. One older page reaches the 5-day test window.
+        if interval == "5m" and candles:
+            try:
+                older = fetch_binance(ticker, binv, limit=1000, end_time_ms=int(candles[0]["ts"] * 1000) - 1)
+            except FetchError:
+                older = []
+            merged: dict[float, dict[str, Any]] = {}
+            for bar in older + candles:
+                merged[bar["ts"]] = bar
+            candles = [merged[k] for k in sorted(merged)]
     else:
         candles = fetch_yahoo(ticker, interval, range_)
     return apply_offset(candles, offset)
