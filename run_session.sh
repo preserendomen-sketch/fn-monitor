@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run the order monitor and the opportunity scanner in one session.
-# The monitor polls every 60s and the scanner every 5 min until the deadline,
-# then both are asked to finish the current cycle and exit.
+# The monitor polls every 60s. The scanner polls every 5 min, or every 60s
+# during the Europe/Ljubljana session-open windows, until the deadline.
+# Both are then asked to finish the current cycle and exit.
 set -u
 cd "$(dirname "$0")"
 

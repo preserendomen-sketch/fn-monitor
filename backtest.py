@@ -9,6 +9,10 @@ P&L is in R, then 50 USD per 1R, minus 0.1R of spread and commission per
 closed trade. A buy/sell stop that is not filled within 60 minutes is not a
 trade. A position still open at 21:00 Europe/Ljubljana is closed at that
 M5 bar's close and counted as expired.
+
+This replays completed M15 decisions after the M1+M5+M15 gate. It does not
+replay the session-open early breakout path; ``scanner.py --backfill`` does.
+Neither path sends a webhook.
 """
 
 from __future__ import annotations
@@ -353,12 +357,14 @@ def collect(days: list) -> tuple[list[Signal], list[Signal]]:
     news = load_news_calendar(sc)
     raw: list[Signal] = []
     for inst in sc["universe"]:
-        m15, h1, m5, daily = fetch_instrument(inst)
+        m15, h1, m5, m1, daily = fetch_instrument(inst, m1_range="5d")
         if not m5:
             log(f"{inst['symbol']}: ni M5, kandidati tega instrumenta v backtestu nimajo izstopa.")
             m5_bars: list[dict[str, Any]] = []
         else:
             m5_bars = m5
+        if not m1:
+            log(f"{inst['symbol']}: ni M1, MTF potrditev tega instrumenta ne gre skozi.")
         starts = [b["ts"] for b in m5_bars]
         for idx, bar in enumerate(m15):
             close_ts = bar["ts"] + 15 * 60
@@ -370,7 +376,7 @@ def collect(days: list) -> tuple[list[Signal], list[Signal]]:
             if not atr_value or atr_value <= 0:
                 continue
             seen: set[str] = set()
-            for cand in evaluate_bar(inst, m15, idx, h1, sc, m5=m5, daily=daily, news=news):
+            for cand in evaluate_bar(inst, m15, idx, h1, sc, m5=m5, daily=daily, news=news, m1=m1):
                 if cand["type"] in seen:
                     continue
                 seen.add(cand["type"])

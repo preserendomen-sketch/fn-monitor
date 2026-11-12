@@ -17,6 +17,11 @@
     "cooldown_minutes": 90,
     "max_alerts_per_day": 8,
     "rvol_min": 1.5,
+    "boost_interval_seconds": 60,
+    "session_open_windows": [
+      {"name": "london", "start": "08:45", "end": "10:00"},
+      {"name": "us_cash", "start": "15:15", "end": "16:30"}
+    ],
     "rsi_ob": 75,
     "rsi_os": 25,
     "wick_frac": 0.5,
