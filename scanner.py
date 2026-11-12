@@ -5,25 +5,26 @@ Alerts go to the same webhook as the order monitor, with event='candidate'.
 Active 08:00-21:00 Europe/Ljubljana on weekdays. Max 8 alerts per day, 2 per
 symbol; 90-minute cooldown per symbol per type.
 
-Decision rules (all of them, or no alert):
+A 5-day capped 2R replay (5, 6, 9, 10 and 11 Nov 2026) reproduced the M15
+baseline at +4.71R. Requiring M1+M5+M15 on every alert fell to +2.34R and
+dropped 11 of those 13 breakout trades. The hybrid below was +1.71R, also
+worse, and is kept for review rather than as a reason to replace the baseline.
 
-- H1 EMA 9/20 is the trend filter. Breakouts must go with it. Retest and
-  pullback need a clear H1 trend. Exhaustion that fights a clear H1 trend
-  is dropped.
-- M15 is structure: breakout through PDH/PDL or the Asian range, retest,
-  pullback to EMA, or exhaustion. A breakout on a completed M15 still needs
-  RVOL >= 1.5 (rvol_min). That threshold is not lowered.
-- M5 is structure. The latest completed M5 inside the M15 must close with
-  the trade, beyond the M15 midpoint, with EMA 9/20 aligned (except
-  exhaustion, where the M5 candle itself must reject — the EMA lags the
-  turn). A breakout M5 must also close beyond the broken level.
-- M1 is timing only. At least two completed M1 bars in the last five
-  minutes must agree with the direction, the last one must not be a spike
-  (wick against the trade >= wick_frac), and it must close beyond the
-  level. One M1 bar is never enough, and an M1 spike never fires alone.
-
-Quality: a breakout that passes is A+. Retest, pullback, and exhaustion
-that pass the stricter full picture are B+ (strong B). Nothing weaker is sent.
+- H1 EMA 9/20, breakout RVOL 1.5, the 0.15× H1 ATR cushion on FX, GER40 and
+  WTI, the ±30 minute news block, caps, and the 90-minute cooldown stay.
+  Exhaustion that fights a clear H1 trend is still dropped.
+- A completed M15 breakout that passes H1, RVOL, and the cushion is valid.
+  Missing M1 or M5 does not drop it. When an M5 bar is present, the baseline
+  midpoint plus EMA 9/20 test still decides the M5 stop: a failed test drops
+  the breakout, a pass stores m5_trigger. M1 is recorded and never a veto.
+- Retest, pullback, and exhaustion wait for a finished M15 and need that
+  same M5 test. Missing M5 drops them. An isolated M1 spike is not an entry.
+- A kept breakout is A+. A kept retest, pullback, or exhaustion is B+.
+- Inside london 08:45-10:00 and us_cash 15:15-16:30 Europe/Ljubljana the
+  loop sleeps 60 seconds. An early breakout can fire before the M15 close
+  only when the forming M15, a completed M5 (RVOL >= 1.5, same cushion),
+  and M1 timing all agree. It uses its own cooldown, so it does not block
+  the later completed M15 breakout.
 
 Session-open windows (Europe/Ljubljana, clock time, end exclusive):
 
@@ -40,9 +41,9 @@ before the M15 bar closes when the forming M15, a completed M5 inside it
 agree. Retest, pullback, and exhaustion still wait for a completed M15,
 because they need a finished candle; the faster loop picks that close up
 within about a minute. Outside the windows the loop stays on
-interval_seconds (default 300) and decides when an M15 bar completes, but
-it still computes M1 and M5. Bars older than max_signal_age_minutes are
-logged as missed and not sent.
+interval_seconds (default 300) and decides when an M15 bar completes.
+M5 is the stop test; M1 is stored and does not veto. Bars older than
+max_signal_age_minutes are logged as missed and not sent.
 
 --backfill and --no-send never call the webhook. Tests must not either.
 """
@@ -705,6 +706,85 @@ def _attach_mtf(
     cand.setdefault("trigger_tf", "M15")
 
 
+def legacy_m5_confirmation(
+    bar: dict[str, Any],
+    direction: str,
+    m5: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Baseline M5 trigger used for completed M15 decisions.
+
+    The latest M5 inside the M15 must close beyond the bar's midpoint with
+    EMA 9/20 aligned. None means the feed did not cover the bar, which keeps
+    a breakout and drops retest, pullback, and exhaustion. False means a bar
+    was there and failed, which drops every type. This is the test from the
+    +4.71R baseline; the stricter M1 cluster is not applied here.
+    """
+    empty = {
+        "m5_confirm": None,
+        "m5_high": None,
+        "m5_low": None,
+        "m5_trigger": None,
+        "m5_ts": None,
+    }
+    if not m5:
+        return empty
+    start = float(bar["ts"])
+    end = start + M15_SEC
+    inside = [(i, b) for i, b in enumerate(m5) if start - 1 <= b["ts"] < end - 1]
+    if not inside:
+        return empty
+    i, last = inside[-1]
+    closes = [b["close"] for b in m5[: i + 1]]
+    e9 = ema_last(closes, 9)
+    e20 = ema_last(closes, 20)
+    mid = (bar["high"] + bar["low"]) / 2.0
+    if direction == "buy":
+        ok = last["close"] > mid and e9 is not None and e20 is not None and e9 > e20
+        trigger = last["high"]
+    else:
+        ok = last["close"] < mid and e9 is not None and e20 is not None and e9 < e20
+        trigger = last["low"]
+    return {
+        "m5_confirm": bool(ok),
+        "m5_high": last["high"],
+        "m5_low": last["low"],
+        "m5_trigger": trigger,
+        "m5_ts": last["ts"],
+    }
+
+
+def cooldown_type(cand: dict[str, Any]) -> str:
+    """Early breakouts do not share the completed-breakout cooldown.
+
+    A session-open entry can fire before the M15 close and still leave the
+    later completed M15 breakout eligible. Two early alerts on the same
+    symbol still cooldown against each other.
+    """
+    if cand.get("type") == "breakout" and cand.get("trigger_tf") in {"M1", "M5"}:
+        return "breakout_early"
+    return str(cand.get("type") or "")
+
+
+def _annotate_m1(
+    cand: dict[str, Any],
+    m1: list[dict[str, Any]] | None,
+    m5_ts: float | None,
+    level: float | None,
+    wick_frac: float,
+) -> None:
+    """Record M1 timing when the bars exist. Never a reason to drop."""
+    if m1 is None or m5_ts is None:
+        cand["m1_confirm"] = None
+        return
+    info = m1_confirmation(
+        cand["direction"], m1, float(m5_ts), float(m5_ts) + M5_SEC, wick_frac, level=level
+    )
+    cand["m1_confirm"] = info["m1_confirm"]
+    cand["m1_high"] = _num(info["m1_high"])
+    cand["m1_low"] = _num(info["m1_low"])
+    cand["m1_trigger"] = _num(info["m1_trigger"])
+
+
 def _gate_candidates(
     inst: dict[str, Any],
     bar: dict[str, Any],
@@ -714,49 +794,40 @@ def _gate_candidates(
     news: tuple[list[dict[str, Any]], bool] | None,
     m1: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Require M5 structure and M1 timing, then the news window.
+    """Baseline M5 trigger, then the news window. M1 does not veto.
 
-    A candidate that exists only on M15 is dropped. Missing M1 or M5 data
-    is a miss, not a pass. m5_confirm in config cannot turn this off.
+    Breakouts survive a missing M5 feed. Any other type needs M5 confirmation.
+    An M5 bar that disagrees drops every type, including breakouts.
     """
     wick_need = float(sc.get("wick_frac") or 0.5)
     gated: list[dict[str, Any]] = []
     for cand in found:
-        kind = "exhaustion" if cand["type"] == "exhaustion" else "trend"
-        level = cand.get("level")
-        info5 = m5_confirmation(
-            bar, cand["direction"], m5, level=level, kind=kind, wick_frac=wick_need
-        )
-        m5_ts = info5.get("m5_ts")
-        if m5_ts is None:
-            info1 = m1_confirmation(cand["direction"], m1, bar["ts"], bar["ts"], wick_need, level=level)
-            if m1 is not None and info1["m1_confirm"] is None:
-                info1 = {**info1, "m1_confirm": False}
-        else:
-            info1 = m1_confirmation(
-                cand["direction"], m1, float(m5_ts), float(m5_ts) + M5_SEC, wick_need, level=level
-            )
-        quality = "A+" if cand["type"] == "breakout" else "B+"
-        if info5["m5_confirm"] is True and info1["m1_confirm"] is True:
-            _attach_mtf(cand, info5, info1, quality)
-            cand["note"] = (
-                f"{cand['note']} MTF {quality}: M15 struktura, M5 struktura, M1 timing."
-            ).strip()
+        info = legacy_m5_confirmation(bar, cand["direction"], m5)
+        cand["m5_confirm"] = info["m5_confirm"]
+        cand["m5_high"] = _num(info["m5_high"])
+        cand["m5_low"] = _num(info["m5_low"])
+        cand["m5_trigger"] = _num(info["m5_trigger"])
+        _annotate_m1(cand, m1, info.get("m5_ts"), cand.get("level"), wick_need)
+        if cand["type"] == "breakout":
+            if info["m5_confirm"] is False:
+                log(f"mtf {inst['symbol']} breakout {cand['direction']} zavrnjen (M5 se ne ujema).")
+                continue
+            cand["quality"] = "A+"
+            cand["mtf"] = "M15+M5" if info["m5_confirm"] is True else "M15"
+            extra = "Kakovost A+."
+            if info["m5_confirm"] is None:
+                extra = "M5 potrditev ni na voljo. " + extra
+            cand["note"] = f"{cand['note']} {extra}".strip()
             gated.append(cand)
             continue
-        why = []
-        if m5 is None:
-            why.append("M5 ni na voljo")
-        elif info5["m5_confirm"] is not True:
-            why.append("M5 se ne ujema")
-        if m1 is None:
-            why.append("M1 ni na voljo")
-        elif info1["m1_confirm"] is not True:
-            why.append("M1 se ne ujema")
-        log(
-            f"mtf {inst['symbol']} {cand['type']} {cand['direction']} zavrnjen "
-            f"({', '.join(why) or 'ni soglasja'})."
-        )
+        if info["m5_confirm"] is not True:
+            why = "M5 ni na voljo" if info["m5_confirm"] is None else "M5 se ne ujema"
+            log(f"mtf {inst['symbol']} {cand['type']} {cand['direction']} zavrnjen ({why}).")
+            continue
+        cand["quality"] = "B+"
+        cand["mtf"] = "M15+M5"
+        cand["note"] = f"{cand['note']} M5 potrditev. Kakovost B+.".strip()
+        gated.append(cand)
 
     if news is None:
         events, ok = load_news_calendar(sc)
@@ -1337,7 +1408,7 @@ def dispatch_candidates(
                 f"zamujen (sveča starejša od {int(max_age // 60)} min)."
             )
             continue
-        if not can_send(state, inst, cand["type"], bar_ts, sc):
+        if not can_send(state, inst, cooldown_type(cand), bar_ts, sc):
             log(
                 f"{inst['symbol']} {cand['type']} {cand['direction']} "
                 f"zavrnjen (cooldown ali dnevni cap)."
@@ -1355,7 +1426,7 @@ def dispatch_candidates(
             )
             if not ok:
                 continue
-        mark_sent(state, inst, cand["type"], bar_ts)
+        mark_sent(state, inst, cooldown_type(cand), bar_ts)
         fired.append(cand)
     return fired
 
@@ -1492,12 +1563,12 @@ def backfill(cfg: dict[str, Any], sc: dict[str, Any], days: int = 1) -> list[dic
     applied: list[dict[str, Any]] = []
     for cand in flagged:
         inst = {"id": cand["symbol"], "symbol": cand["symbol"]}
-        if not can_send(fake_state, inst, cand["type"], cand["bar_ts"], sc):
+        if not can_send(fake_state, inst, cooldown_type(cand), cand["bar_ts"], sc):
             cand = dict(cand)
             cand["suppressed"] = True
             applied.append(cand)
             continue
-        mark_sent(fake_state, inst, cand["type"], cand["bar_ts"])
+        mark_sent(fake_state, inst, cooldown_type(cand), cand["bar_ts"])
         applied.append(cand)
     return applied
 

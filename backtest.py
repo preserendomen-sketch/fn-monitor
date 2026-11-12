@@ -10,14 +10,16 @@ closed trade. A buy/sell stop that is not filled within 60 minutes is not a
 trade. A position still open at 21:00 Europe/Ljubljana is closed at that
 M5 bar's close and counted as expired.
 
-This replays completed M15 decisions after the M1+M5+M15 gate. It does not
-replay the session-open early breakout path; ``scanner.py --backfill`` does.
-Neither path sends a webhook.
+This replays the hybrid on this branch: completed M15 decisions, plus
+session-open early breakouts that do not share the breakout cooldown.
+On 5–11 Nov 2026 that hybrid was +1.71R capped at 2R, behind the M15
+baseline at +4.71R. It does not send a webhook.
 """
 
 from __future__ import annotations
 
 import bisect
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,9 +30,11 @@ from scanner import (
     can_send,
     day_key,
     evaluate_bar,
+    evaluate_early_breakout,
     fetch_instrument,
     hm_on_day,
     in_active_hours,
+    iter_early_decisions,
     load_news_calendar,
     local_dt,
     log,
@@ -62,6 +66,8 @@ class Signal:
     atr: float
     bars: list[dict[str, Any]]
     index: int
+    early: bool = False
+    anchor_ts: float = 0.0
 
 
 @dataclass
@@ -364,7 +370,7 @@ def collect(days: list) -> tuple[list[Signal], list[Signal]]:
         else:
             m5_bars = m5
         if not m1:
-            log(f"{inst['symbol']}: ni M1, MTF potrditev tega instrumenta ne gre skozi.")
+            log(f"{inst['symbol']}: ni M1, zgodnji breakout tega instrumenta ni mogoč.")
         starts = [b["ts"] for b in m5_bars]
         for idx, bar in enumerate(m15):
             close_ts = bar["ts"] + 15 * 60
@@ -398,14 +404,56 @@ def collect(days: list) -> tuple[list[Signal], list[Signal]]:
                         index=bisect.bisect_left(starts, close_ts),
                     )
                 )
+        if m5 and m1:
+            decisions, _, _ = iter_early_decisions(m5, m1, -1.0, -1.0, time.time(), sc)
+            for decision_ts, trigger_tf in decisions:
+                if local_dt(decision_ts).date() not in wanted:
+                    continue
+                period = float(int(decision_ts) - (int(decision_ts) % (15 * 60)))
+                prior = [b for b in m15 if b["ts"] + 15 * 60 <= period + 1]
+                atr_value = atr(prior, 14) if prior else None
+                if not atr_value or atr_value <= 0:
+                    continue
+                parts = [b for b in m1 if period - 1 <= b["ts"] and b["ts"] + 60 <= decision_ts + 1]
+                for cand in evaluate_early_breakout(
+                    inst, m15, m5, m1, h1, sc, decision_ts, trigger_tf=trigger_tf, news=news
+                ):
+                    if parts:
+                        low = min(b["low"] for b in parts)
+                        high = max(b["high"] for b in parts)
+                    else:
+                        low = float(cand.get("m5_low") or cand["broker_price"])
+                        high = float(cand.get("m5_high") or cand["broker_price"])
+                    raw.append(
+                        Signal(
+                            symbol=cand["symbol"],
+                            ctype=cand["type"],
+                            direction=cand["direction"],
+                            close_ts=decision_ts,
+                            close=float(cand["broker_price"]),
+                            m15_low=low,
+                            m15_high=high,
+                            m5_low=cand.get("m5_low"),
+                            m5_high=cand.get("m5_high"),
+                            m5_trigger=cand.get("m5_trigger"),
+                            m5_confirm=cand.get("m5_confirm"),
+                            atr=float(atr_value),
+                            bars=m5_bars,
+                            index=bisect.bisect_left(starts, decision_ts),
+                            early=True,
+                            anchor_ts=float(cand["bar_ts"]),
+                        )
+                    )
     raw.sort(key=lambda s: (s.close_ts, s.symbol, s.ctype))
     state: dict[str, Any] = {"day": day_key(), "sent_today": 0, "sent_today_by_symbol": {}, "last": {}}
     capped: list[Signal] = []
     for sig in raw:
         inst = {"id": sig.symbol, "symbol": sig.symbol}
-        if not can_send(state, inst, sig.ctype, sig.close_ts - 15 * 60, sc):
+        anchor = sig.anchor_ts or (sig.close_ts - 15 * 60)
+        ctype = "breakout_early" if sig.early else sig.ctype
+        if not can_send(state, inst, ctype, anchor, sc):
             continue
-        mark_sent(state, inst, sig.ctype, sig.close_ts - 15 * 60)
+        mark_sent(state, inst, ctype, anchor)
         capped.append(sig)
     return capped, raw
 

@@ -357,39 +357,66 @@ class MtfTests(unittest.TestCase):
         )
         self.assertEqual([c["type"] for c in agreed], ["breakout"])
         self.assertEqual(agreed[0]["quality"], "A+")
-        self.assertEqual(agreed[0]["mtf"], "M1+M5+M15")
+        self.assertEqual(agreed[0]["mtf"], "M15+M5")
         self.assertEqual(agreed[0]["trigger_tf"], "M15")
         self.assertTrue(agreed[0]["m5_confirm"])
-        self.assertTrue(agreed[0]["m1_confirm"])
         self.assertEqual(agreed[0]["direction"], "buy")
 
-        self.assertEqual(
-            evaluate_bar(
-                market.inst, market.m15, idx, market.h1, market.sc,
-                m5=market.m5, news=news, m1=None,
-            ),
-            [],
+        # Missing M1 is not a veto on a completed breakout.
+        no_m1 = evaluate_bar(
+            market.inst, market.m15, idx, market.h1, market.sc,
+            m5=market.m5, news=news, m1=None,
         )
-        self.assertEqual(
-            evaluate_bar(
-                market.inst, market.m15, idx, market.h1, market.sc,
-                m5=None, news=news, m1=market.m1,
-            ),
-            [],
+        self.assertEqual(len(no_m1), 1)
+        self.assertEqual(no_m1[0]["quality"], "A+")
+        self.assertIsNone(no_m1[0]["m1_confirm"])
+
+        # Missing M5 feed keeps the breakout and does not invent a stop trigger.
+        no_m5 = evaluate_bar(
+            market.inst, market.m15, idx, market.h1, market.sc,
+            m5=None, news=news, m1=market.m1,
         )
+        self.assertEqual(len(no_m5), 1)
+        self.assertIsNone(no_m5[0]["m5_confirm"])
+        self.assertEqual(no_m5[0]["mtf"], "M15")
+
+        # An M1 spike does not cancel the completed M15 breakout.
         spiked = self._market(last_m1="spike")
-        self.assertEqual(
-            evaluate_bar(
-                spiked.inst, spiked.m15, len(spiked.m15) - 1, spiked.h1, spiked.sc,
-                m5=spiked.m5, news=news, m1=spiked.m1,
-            ),
-            [],
+        spiked_hit = evaluate_bar(
+            spiked.inst, spiked.m15, len(spiked.m15) - 1, spiked.h1, spiked.sc,
+            m5=spiked.m5, news=news, m1=spiked.m1,
         )
+        self.assertEqual(len(spiked_hit), 1)
+        self.assertFalse(spiked_hit[0]["m1_confirm"])
+        self.assertEqual(spiked_hit[0]["quality"], "A+")
+
+        # A lone M1 bar is not an entry, and it also does not veto the M15 breakout.
         single = self._market(last_m1="single")
+        self.assertFalse(
+            m1_confirmation(
+                "buy", single.m1[-1:], single.m1[-1]["ts"], single.m1[-1]["ts"] + 300, 0.5, level=PDH
+            )["m1_confirm"]
+        )
+        self.assertEqual(
+            len(
+                evaluate_bar(
+                    single.inst, single.m15, len(single.m15) - 1, single.h1, single.sc,
+                    m5=single.m5, news=news, m1=single.m1,
+                )
+            ),
+            1,
+        )
+
+        # An M5 bar that closes back through the midpoint still drops the breakout.
+        disagreed = [dict(b) for b in market.m5]
+        last = dict(disagreed[-1])
+        last["close"] = 99.0
+        last["open"] = 99.4
+        disagreed[-1] = last
         self.assertEqual(
             evaluate_bar(
-                single.inst, single.m15, len(single.m15) - 1, single.h1, single.sc,
-                m5=single.m5, news=news, m1=single.m1,
+                market.inst, market.m15, idx, market.h1, market.sc,
+                m5=disagreed, news=news, m1=market.m1,
             ),
             [],
         )
@@ -462,14 +489,14 @@ class MtfTests(unittest.TestCase):
         self.assertEqual(early[0]["trigger_tf"], "M5")
         self.assertEqual(early[0]["session_open"], "london")
         self.assertIn("M5 RVOL", early[0]["note"])
-        # The completed M15 is the same market, but its last M1 is a spike.
-        self.assertEqual(
-            evaluate_bar(
-                market.inst, market.m15, len(market.m15) - 1, market.h1, market.sc,
-                m5=market.m5, news=news, m1=market.m1,
-            ),
-            [],
+        # The spike on the completed bar does not veto that M15 breakout.
+        completed = evaluate_bar(
+            market.inst, market.m15, len(market.m15) - 1, market.h1, market.sc,
+            m5=market.m5, news=news, m1=market.m1,
         )
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["trigger_tf"], "M15")
+        self.assertEqual(completed[0]["quality"], "A+")
         # Noon has the same microstructure and is outside both windows.
         noon = self._market(hour=12, minute=0)
         self.assertEqual(
@@ -518,16 +545,29 @@ class MtfTests(unittest.TestCase):
         )
         self.assertEqual(len(kept), 1)
         self.assertEqual(kept[0]["quality"], "B+")
-        self.assertTrue(kept[0]["m1_confirm"] and kept[0]["m5_confirm"])
-        self.assertEqual(
-            scanner._gate_candidates(
-                market.inst, bar, [dict(cand)], market.m5, market.sc, ([], True), m1=None
-            ),
-            [],
+        self.assertTrue(kept[0]["m5_confirm"])
+        # M1 is optional. Missing M1 does not drop a confirmed retest.
+        without_m1 = scanner._gate_candidates(
+            market.inst, bar, [dict(cand)], market.m5, market.sc, ([], True), m1=None
         )
+        self.assertEqual(len(without_m1), 1)
+        self.assertEqual(without_m1[0]["quality"], "B+")
+        # Missing M5 does drop retest, pullback, and exhaustion.
         self.assertEqual(
             scanner._gate_candidates(
                 market.inst, bar, [dict(cand)], None, market.sc, ([], True), m1=market.m1
+            ),
+            [],
+        )
+        exhaustion = dict(cand, type="exhaustion")
+        confirmed = scanner._gate_candidates(
+            market.inst, bar, [exhaustion], market.m5, market.sc, ([], True), m1=None
+        )
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0]["quality"], "B+")
+        self.assertEqual(
+            scanner._gate_candidates(
+                market.inst, bar, [dict(cand, type="pullback")], None, market.sc, ([], True), m1=market.m1
             ),
             [],
         )
@@ -577,6 +617,14 @@ class MtfTests(unittest.TestCase):
         )
         self.assertEqual(len(sent), 1)
 
+        # An early breakout does not consume the completed-breakout cooldown.
+        early_ts = market.signal
+        m15_ts = market.signal
+        state4 = {"day": day_key(now), "sent_today": 0, "sent_today_by_symbol": {}, "last": {}}
+        scanner.mark_sent(state4, market.inst, scanner.cooldown_type(cand), early_ts)
+        self.assertTrue(scanner.can_send(state4, market.inst, "breakout", m15_ts, market.sc))
+        self.assertFalse(scanner.can_send(state4, market.inst, "breakout_early", m15_ts + 60, market.sc))
+
     def test_backfill_replays_early_breakout_without_webhook(self) -> None:
         market = self._market(last_m1="spike")
 
@@ -594,8 +642,9 @@ class MtfTests(unittest.TestCase):
         alerts = [c for c in flagged if not c.get("suppressed")]
         self.assertTrue(alerts)
         self.assertTrue(all(c["type"] == "breakout" and c["quality"] == "A+" for c in alerts))
-        self.assertTrue(all(c["trigger_tf"] in {"M1", "M5"} for c in alerts))
-        self.assertTrue(all(c.get("m1_confirm") and c.get("m5_confirm") for c in alerts))
+        m15_alerts = [c for c in alerts if c.get("trigger_tf") == "M15"]
+        self.assertTrue(m15_alerts)
+        self.assertTrue(m15_alerts[0]["m5_confirm"])
 
 
 if __name__ == "__main__":
