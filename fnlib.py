@@ -374,17 +374,31 @@ def fetch_candles(instrument: dict[str, Any], interval: str, range_: str = "5d")
     offset = float(instrument.get("offset") or 0)
     if source == "binance":
         binv = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "60m": "1h", "1d": "1d"}.get(interval, interval)
-        limit = 1000 if interval in ("5m", "15m", "1h", "60m", "1d") else 120
+        # 1m used to stop at 120 bars (the order monitor fetches 1m itself with
+        # a small limit). The scanner needs a full session of M1 for timing.
+        limit = 1000 if interval in ("1m", "5m", "15m", "1h", "60m", "1d") else 120
         candles = fetch_binance(ticker, binv, limit=limit)
-        # 1000 M5 bars cover ~3.5 days. One older page reaches the 5-day test window.
-        if interval == "5m" and candles:
-            try:
-                older = fetch_binance(ticker, binv, limit=1000, end_time_ms=int(candles[0]["ts"] * 1000) - 1)
-            except FetchError:
-                older = []
-            merged: dict[float, dict[str, Any]] = {}
-            for bar in older + candles:
-                merged[bar["ts"]] = bar
+        # M5: 1000 bars are ~3.5 days, so one older page reaches the 5-day window.
+        # M1 backfill (range 5d/7d): three older pages cover ~2.8 days. Live scans
+        # pass range 1d and take a single page (1000 minutes, about 16 hours).
+        extra_pages = 0
+        if interval == "5m":
+            extra_pages = 1
+        elif interval == "1m" and range_ in {"5d", "7d"}:
+            extra_pages = 3
+        if extra_pages and candles:
+            merged: dict[float, dict[str, Any]] = {bar["ts"]: bar for bar in candles}
+            end_ms = int(candles[0]["ts"] * 1000) - 1
+            for _ in range(extra_pages):
+                try:
+                    older = fetch_binance(ticker, binv, limit=limit, end_time_ms=end_ms)
+                except FetchError:
+                    break
+                if not older:
+                    break
+                for bar in older:
+                    merged[bar["ts"]] = bar
+                end_ms = int(older[0]["ts"] * 1000) - 1
             candles = [merged[k] for k in sorted(merged)]
     else:
         candles = fetch_yahoo(ticker, interval, range_)

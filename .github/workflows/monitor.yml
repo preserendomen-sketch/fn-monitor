@@ -7,7 +7,11 @@ name: Monitor
 # fires. cancel-in-progress is false: the running job is not killed, and the
 # newest waiting run starts when it exits. An intermediate queued run can be
 # replaced, but the 28-minute job already covers that slot. If GitHub starts
-# a cron late, the scanner still emits M15 signals that closed within 45 minutes.
+# a cron late, the scanner still emits signals that closed within 45 minutes.
+# Inside the 28-minute loop the scanner polls every 5 minutes, and every
+# 60 seconds during the Europe/Ljubljana session-open windows 08:45–10:00
+# and 15:15–16:30, so M1 and M5 closes around London and the US cash open
+# are evaluated then instead of waiting for the next M15 close.
 on:
   schedule:
     - cron: "*/15 6-20 * * 1-5"

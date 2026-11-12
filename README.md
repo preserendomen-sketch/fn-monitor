@@ -5,10 +5,30 @@ Monitor čakajočih nalogov in skener priložnosti, ki tečeta na GitHub Actions
 ## Kaj počne
 
 - **Monitor** (`monitor.py`) vsakih 60 sekund preveri čakajoče naloge in pošlje webhook ob dogodkih `near_entry`, `triggered`, `m15_close_against`, `near_sl`, `sl_hit`, `tp_hit` in `halfway_to_tp`.
-- **Skener** (`scanner.py`) vsakih 5 minut pregleda deset simbolov (EURUSD, GBPUSD, AUDUSD, USDJPY, XAUUSD, USOUSD, BTCUSD, NAS100, GER40, US30) in javi kandidate `breakout`, `retest` in `exhaustion`. USOUSD je surova nafta WTI.
+- **Skener** (`scanner.py`) pregleda deset simbolov (EURUSD, GBPUSD, AUDUSD, USDJPY, XAUUSD, USOUSD, BTCUSD, NAS100, GER40, US30) in javi kandidate `breakout`, `retest`, `pullback` in `exhaustion`. Zaključen M15 breakout ne čaka na M1. Zgodnji vstop okoli odprtja je dodatek in ne zavrne poznejšega M15. USOUSD je surova nafta WTI. Zunaj odprtij sej teče na 5 minut; v oknih odprtja (08:45–10:00 in 15:15–16:30 po času Europe/Ljubljana) na približno 60 sekund.
 - Oba tečeta v istem zagonu približno 28 minut. Razpored je na vsakih 15 minut ob delavnikih, od 06:00 do 20:45 UTC (pozimi približno 07:00–21:45 po času Europe/Ljubljana, poleti uro pozneje). Tek, ki že teče, se ne prekine. Če GitHub zamudi, skener ob naslednjem zagonu še pošlje sveče, ki so se zaprle v zadnjih 45 minutah; starejše samo zapiše kot `zamujen`.
-- Stanje (že poslani dogodki, cooldowni, dnevne omejitve) se med zagoni shrani v predpomnilnik Actions, da se isto opozorilo ne pošlje dvakrat. Skener sme na dan poslati največ **2 kandidata na simbol** in **8 skupaj**.
+- Stanje (že poslani dogodki, cooldowni, dnevne omejitve) se med zagoni shrani v predpomnilnik Actions, da se isto opozorilo ne pošlje dvakrat. Skener sme na dan poslati največ **2 kandidata na simbol** in **8 skupaj**. Med tipom in simbolom velja še **90-minutni** cooldown.
 - BTCUSD je samo v skenerju. Med nalogi ga ni, ker ga je posrednik zavrnil.
+
+## Kako skener sestavi signal
+
+Petdnevni capped replay (5., 6., 9., 10. in 11. november 2026, cilj 2R) je osnovno pravilo M15 ponovil pri **+4,71R**. Trda zahteva M1+M5+M15 je padla na +2,34R in je izgubila 11 od 13 breakout poslov. Hibrid v tej veji je bil +1,71R, torej slabši. Koda je za pregled, ne kot zamenjava osnovnega pravila.
+
+- **H1** ostane filter trenda (EMA 9/20). Breakout RVOL ostane **≥ 1.5**. Odmik 0,15× H1 ATR za FX, GER40 in WTI ostane. Novice ±30 minut, cap in 90-minutni cooldown ostanejo. Exhaustion proti jasnemu H1 trendu odpade.
+- **Zaključen M15 breakout**, ki gre skozi H1, RVOL in odmik, je veljaven. Manjkajoč M1 ali M5 ga ne zavrže. Če je M5 na voljo, velja stari test (zaprtje čez sredino M15 in EMA 9/20). Padec testa zavrže breakout. Uspeh da M5 stop, kot doslej. M1 se zapiše in ni veto.
+- **Retest, pullback in exhaustion** čakajo na zaključeno M15 in rabijo isti M5 test. Brez M5 jih ni. Osamljen M1 skok ni vstop.
+- Breakout, ki ostane, je **A+**. Retest, pullback in exhaustion so **B+** samo z M5 potrditvijo.
+
+### Odprtja sej
+
+Okoli londonskega odprtja in ameriškega denarnega odprtja skener ne čaka na zaključek M15. Okna so v času **Europe/Ljubljana**, konec ni vključen. 09:00 po ljubljansko je londonsko odprtje vse leto, ker oba premakneta uro skupaj. 15:30 je običajno NYSE 09:30; v tednu ali dveh, ko se poletni čas v ZDA in Evropi ne preklopi isti vikend, je okno dovolj široko, da odprtje še vedno pade vanj.
+
+- **london** 08:45–10:00
+- **us_cash** 15:15–16:30
+
+V oknu zanka spi `boost_interval_seconds` (privzeto 60) in bere zaključene M1 in M5. Breakout pred zaključkom M15 je dovoljen samo, če se tekoča M15, zaključena M5 (RVOL ≥ 1.5, isti odmik) in M1 timing ujemajo. Ta zgodnji alarm ima svoj cooldown in ne blokira poznejšega zaključenega M15 breakouta. Zaprtje točno ob :00, :15, :30 ali :45 prevzame zaključena M15. Retest, pullback in exhaustion čakajo na zaključeno svečo.
+
+Zunaj oken skener ostane na 5 minutah in odloča ob zaključeni M15. Sveče, starejše od 45 minut, zapiše kot zamujene in jih ne pošlje. `--backfill` in `--no-send` webhooka ne kličeta. Testi ga tudi ne smejo.
 
 Cene za Yahoo Finance se najprej prenesejo s `curl_cffi` (posnemanje brskalnika Chrome). Če Yahoo zavrne IP GitHubovega tekača, sledi navaden `urllib`, nato še `query2.finance.yahoo.com`. BTC pride z Binance; če je `api.binance.com` blokiran, se uporabi `data-api.binance.vision`.
 

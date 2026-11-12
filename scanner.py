@@ -1,10 +1,51 @@
 #!/usr/bin/env python3
 """Opportunity scanner for FundedNext day-trading setups.
 
-Every 5 minutes, on completed M15 candles (H1 for trend), flags a candidate
-only when one of the strict filters holds. Alerts go to the same webhook as
-the order monitor, with event='candidate'. Active 08:00-21:00 Europe/Ljubljana
-on weekdays. Max 8 alerts per day, 2 per symbol; 90-minute cooldown per symbol per type.
+Alerts go to the same webhook as the order monitor, with event='candidate'.
+Active 08:00-21:00 Europe/Ljubljana on weekdays. Max 8 alerts per day, 2 per
+symbol; 90-minute cooldown per symbol per type.
+
+A 5-day capped 2R replay (5, 6, 9, 10 and 11 Nov 2026) reproduced the M15
+baseline at +4.71R. Requiring M1+M5+M15 on every alert fell to +2.34R and
+dropped 11 of those 13 breakout trades. The hybrid below was +1.71R, also
+worse, and is kept for review rather than as a reason to replace the baseline.
+
+- H1 EMA 9/20, breakout RVOL 1.5, the 0.15× H1 ATR cushion on FX, GER40 and
+  WTI, the ±30 minute news block, caps, and the 90-minute cooldown stay.
+  Exhaustion that fights a clear H1 trend is still dropped.
+- A completed M15 breakout that passes H1, RVOL, and the cushion is valid.
+  Missing M1 or M5 does not drop it. When an M5 bar is present, the baseline
+  midpoint plus EMA 9/20 test still decides the M5 stop: a failed test drops
+  the breakout, a pass stores m5_trigger. M1 is recorded and never a veto.
+- Retest, pullback, and exhaustion wait for a finished M15 and need that
+  same M5 test. Missing M5 drops them. An isolated M1 spike is not an entry.
+- A kept breakout is A+. A kept retest, pullback, or exhaustion is B+.
+- Inside london 08:45-10:00 and us_cash 15:15-16:30 Europe/Ljubljana the
+  loop sleeps 60 seconds. An early breakout can fire before the M15 close
+  only when the forming M15, a completed M5 (RVOL >= 1.5, same cushion),
+  and M1 timing all agree. It uses its own cooldown, so it does not block
+  the later completed M15 breakout.
+
+Session-open windows (Europe/Ljubljana, clock time, end exclusive):
+
+- london 08:45-10:00, around the 09:00 London open (London and Ljubljana
+  shift together, so 09:00 local stays the London open all year).
+- us_cash 15:15-16:30, around the 15:30 US cash open (NYSE 09:30). The
+  US/EU DST switch differs by a week or two; the window is wide enough
+  to cover that.
+
+Inside those windows the loop sleeps boost_interval_seconds (default 60)
+and evaluates every newly completed M1 and M5 bar. A breakout may fire
+before the M15 bar closes when the forming M15, a completed M5 inside it
+(RVOL >= 1.5 on that M5, same cushion beyond the level), and M1 timing all
+agree. Retest, pullback, and exhaustion still wait for a completed M15,
+because they need a finished candle; the faster loop picks that close up
+within about a minute. Outside the windows the loop stays on
+interval_seconds (default 300) and decides when an M15 bar completes.
+M5 is the stop test; M1 is stored and does not veto. Bars older than
+max_signal_age_minutes are logged as missed and not sent.
+
+--backfill and --no-send never call the webhook. Tests must not either.
 """
 
 from __future__ import annotations
@@ -71,8 +112,18 @@ def scanner_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
     sc.setdefault("news_window_minutes", 30)
     sc.setdefault("news_cache_seconds", 3600)
     sc.setdefault("news_url", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+    # Older configs may set m5_confirm. M1 and M5 agreement is mandatory either way.
     sc.setdefault("m5_confirm", True)
     sc.setdefault("max_signal_age_minutes", 45)
+    sc.setdefault("boost_interval_seconds", 60)
+    # Clock windows in Europe/Ljubljana. End is exclusive. See the module docstring.
+    sc.setdefault(
+        "session_open_windows",
+        [
+            {"name": "london", "start": "08:45", "end": "10:00"},
+            {"name": "us_cash", "start": "15:15", "end": "16:30"},
+        ],
+    )
     if not sc.get("universe"):
         raise SystemExit("config.json nima scanner.universe")
     for inst in sc["universe"]:
@@ -84,6 +135,101 @@ def scanner_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
 
 def local_dt(ts: float) -> datetime:
     return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(LJ_TZ)
+
+
+M15_SEC = 15 * 60
+M5_SEC = 5 * 60
+M1_SEC = 60
+
+_DEFAULT_WINDOWS = (
+    {"name": "london", "start": "08:45", "end": "10:00"},
+    {"name": "us_cash", "start": "15:15", "end": "16:30"},
+)
+
+
+def _valid_hm(hm: str) -> bool:
+    parts = str(hm).split(":")
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        return False
+    hour, minute = int(parts[0]), int(parts[1])
+    return 0 <= hour <= 23 and 0 <= minute <= 59
+
+
+def session_open_windows(sc: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """(name, start_hm, end_hm) in Europe/Ljubljana. End is exclusive."""
+    raw = sc.get("session_open_windows") or _DEFAULT_WINDOWS
+    out: list[tuple[str, str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "session")
+        start = str(item.get("start") or "")
+        end = str(item.get("end") or "")
+        if _valid_hm(start) and _valid_hm(end) and start != end:
+            out.append((name, start, end))
+    return out
+
+
+def in_session_open_window(ts: float, sc: dict[str, Any]) -> str | None:
+    """Name of the session-open window that contains ts, or None.
+
+    This is a clock check in Europe/Ljubljana. Weekday and 08:00-21:00
+    gating stays in in_active_hours; a Saturday morning is inside the
+    clock window and still cannot alert.
+    """
+    dt = local_dt(ts)
+    for name, start_hm, end_hm in session_open_windows(sc):
+        start = hm_on_day(dt.date(), start_hm)
+        end = hm_on_day(dt.date(), end_hm)
+        if start <= dt < end:
+            return name
+    return None
+
+
+def next_session_open_start(now: float, sc: dict[str, Any], horizon: float) -> float | None:
+    """Next window start strictly after now and within horizon seconds."""
+    if horizon <= 0:
+        return None
+    dt = local_dt(now)
+    best: float | None = None
+    for add in (0, 1):
+        day = dt.date() + timedelta(days=add)
+        for _name, start_hm, _end in session_open_windows(sc):
+            start = hm_on_day(day, start_hm).timestamp()
+            if now < start <= now + horizon and (best is None or start < best):
+                best = start
+    return best
+
+
+def scanner_sleep_seconds(now: float, sc: dict[str, Any], elapsed: float) -> float:
+    """Sleep after a scan that took `elapsed` seconds.
+
+    Outside the session-open windows the base is interval_seconds (5 min).
+    If a window opens before that sleep ends, wake at the open so the first
+    M1/M5 of the drive is not missed. Inside a window the base is
+    boost_interval_seconds (60s): completed M1 and M5 bars are evaluated
+    on the next loop instead of waiting for the M15 close.
+    """
+    boost = in_session_open_window(now, sc) is not None
+    if boost:
+        base = float(sc.get("boost_interval_seconds") or 60)
+    else:
+        base = float(sc.get("interval_seconds") or 300)
+    wait = base - max(0.0, elapsed)
+    if wait < 5.0:
+        wait = 5.0
+    if not boost:
+        nxt = next_session_open_start(now, sc, wait)
+        if nxt is not None:
+            until = nxt - now
+            if 0 < until < wait:
+                wait = max(1.0, until)
+    return wait
+
+
+def on_m15_boundary(close_ts: float) -> bool:
+    """True when a bar close is also an M15 close (epoch-aligned)."""
+    return int(round(close_ts)) % M15_SEC == 0
 
 
 def completed(bars: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -311,36 +457,171 @@ def touches_from_trend_side(bar: dict[str, Any], level: float | None, direction:
     return bar["open"] <= level and bar["high"] >= level and bar["close"] < level
 
 
-def m5_confirmation(bar: dict[str, Any], direction: str, m5: list[dict[str, Any]] | None) -> dict[str, Any]:
-    """Latest completed M5 inside the M15 bar.
+def volume_ok(bars: list[dict[str, Any]], idx: int, rvol_min: float) -> tuple[bool, float | None]:
+    """RVOL gate used for breakouts. The threshold is rvol_min (1.5) and is not lowered.
 
-    None for m5_confirm means the feed did not cover this bar. False means a
-    bar was available and did not confirm.
+    A bar with no volume passes only when the feed usually has no volume
+    (Yahoo FX, cash DAX). A hole in a feed that normally prints volume fails.
     """
-    empty = {"m5_confirm": None, "m5_high": None, "m5_low": None, "m5_trigger": None}
-    if not m5:
-        return empty
-    start = float(bar["ts"])
-    end = start + 15 * 60
-    inside = [(i, b) for i, b in enumerate(m5) if start - 1 <= b["ts"] < end - 1]
-    if not inside:
-        return empty
-    i, last = inside[-1]
-    closes = [b["close"] for b in m5[: i + 1]]
-    e9 = ema_last(closes, 9)
-    e20 = ema_last(closes, 20)
-    mid = (bar["high"] + bar["low"]) / 2.0
-    if direction == "buy":
-        ok = last["close"] > mid and e9 is not None and e20 is not None and e9 > e20
-        trigger = last["high"]
-    else:
-        ok = last["close"] < mid and e9 is not None and e20 is not None and e9 < e20
-        trigger = last["low"]
+    rvol = relative_volume(bars, idx, 20)
+    recent = bars[max(0, idx - 40): idx + 1]
+    nz = sum(1 for b in recent if (b.get("volume") or 0) > 0)
+    typically_has_volume = nz >= max(5, int(len(recent) * 0.3))
+    if rvol is None:
+        return (not typically_has_volume), None
+    return rvol >= rvol_min, rvol
+
+
+def _m5_fields(confirm: bool | None, last: dict[str, Any] | None, direction: str) -> dict[str, Any]:
+    if last is None:
+        return {
+            "m5_confirm": confirm,
+            "m5_high": None,
+            "m5_low": None,
+            "m5_trigger": None,
+            "m5_ts": None,
+            "m5_open": None,
+            "m5_close": None,
+        }
     return {
-        "m5_confirm": bool(ok),
+        "m5_confirm": confirm,
         "m5_high": last["high"],
         "m5_low": last["low"],
-        "m5_trigger": trigger,
+        "m5_trigger": last["high"] if direction == "buy" else last["low"],
+        "m5_ts": last["ts"],
+        "m5_open": last["open"],
+        "m5_close": last["close"],
+    }
+
+
+def m5_confirmation(
+    bar: dict[str, Any],
+    direction: str,
+    m5: list[dict[str, Any]] | None,
+    *,
+    level: float | None = None,
+    kind: str = "trend",
+    wick_frac: float = 0.5,
+) -> dict[str, Any]:
+    """Latest completed M5 inside the M15 bar must agree with the M15 structure.
+
+    None means the M5 feed is missing. False means bars were available and
+    did not agree — including when none of them fall inside this M15.
+    One failing M5 blocks the alert; there is no single-timeframe pass.
+
+    Trend-following kinds (breakout, retest, pullback) need a directional
+    close, a close beyond the M15 midpoint, EMA 9/20 aligned with the trade,
+    and a close beyond `level` when a level is given.
+
+    Exhaustion is the turn, so M5 EMA 9/20 is allowed to still point with
+    the push that just failed. The M5 candle itself must close in the fade
+    direction, through the M15 midpoint, and either wick off the extreme
+    or close back through the level.
+    """
+    if m5 is None:
+        return _m5_fields(None, None, direction)
+    start = float(bar["ts"])
+    end = start + M15_SEC
+    inside = [(i, b) for i, b in enumerate(m5) if start - 1 <= b["ts"] < end - 1]
+    if not inside:
+        return _m5_fields(False, None, direction)
+    i, last = inside[-1]
+    closes = [b["close"] for b in m5[: i + 1]]
+    mid = (bar["high"] + bar["low"]) / 2.0
+    if kind == "exhaustion":
+        upper, lower = wick_fractions(last)
+        if direction == "sell":
+            rejected = upper >= wick_frac or (level is not None and last["close"] < level)
+            ok = last["close"] < last["open"] and last["close"] < mid and rejected
+        else:
+            rejected = lower >= wick_frac or (level is not None and last["close"] > level)
+            ok = last["close"] > last["open"] and last["close"] > mid and rejected
+        return _m5_fields(bool(ok), last, direction)
+
+    e9 = ema_last(closes, 9)
+    e20 = ema_last(closes, 20)
+    if direction == "buy":
+        ok = (
+            last["close"] > mid
+            and last["close"] > last["open"]
+            and e9 is not None
+            and e20 is not None
+            and e9 > e20
+        )
+        if level is not None and not last["close"] > level:
+            ok = False
+    else:
+        ok = (
+            last["close"] < mid
+            and last["close"] < last["open"]
+            and e9 is not None
+            and e20 is not None
+            and e9 < e20
+        )
+        if level is not None and not last["close"] < level:
+            ok = False
+    return _m5_fields(bool(ok), last, direction)
+
+
+def m1_confirmation(
+    direction: str,
+    m1: list[dict[str, Any]] | None,
+    start_ts: float,
+    end_ts: float,
+    wick_frac: float,
+    *,
+    level: float | None = None,
+) -> dict[str, Any]:
+    """Timing cluster inside [start_ts, end_ts). Not a standalone signal.
+
+    None means the M1 feed is missing. False means the bars do not agree.
+    Agreement requires all of:
+
+    - at least two completed M1 bars (a single print is an isolated spike)
+    - the last bar closes in the trade direction, not a doji
+    - the wick against the trade is shorter than wick_frac of the range
+    - a strict majority of closes hold the trade side of the cluster's open
+    - the last close itself holds that open, and holds `level` when given
+    """
+    empty = {"m1_confirm": None, "m1_high": None, "m1_low": None, "m1_trigger": None, "m1_ts": None}
+    if m1 is None:
+        return empty
+    inside = [b for b in m1 if start_ts - 1 <= b["ts"] < end_ts - 1]
+    if len(inside) < 2:
+        last = inside[-1] if inside else None
+        return {
+            "m1_confirm": False,
+            "m1_high": None if last is None else last["high"],
+            "m1_low": None if last is None else last["low"],
+            "m1_trigger": None,
+            "m1_ts": None if last is None else last["ts"],
+        }
+    last = inside[-1]
+    upper, lower = wick_fractions(last)
+    anchor = inside[0]["open"]
+    if direction == "buy":
+        directional = last["close"] > last["open"]
+        spike = upper >= wick_frac
+        above = sum(1 for b in inside if b["close"] > anchor)
+        below = sum(1 for b in inside if b["close"] < anchor)
+        hold = last["close"] > anchor
+        beyond = level is None or last["close"] > level
+        trigger = last["high"]
+    else:
+        directional = last["close"] < last["open"]
+        spike = lower >= wick_frac
+        above = sum(1 for b in inside if b["close"] < anchor)
+        below = sum(1 for b in inside if b["close"] > anchor)
+        hold = last["close"] < anchor
+        beyond = level is None or last["close"] < level
+        trigger = last["low"]
+    ok = directional and not spike and above > below and hold and beyond
+    return {
+        "m1_confirm": bool(ok),
+        "m1_high": last["high"],
+        "m1_low": last["low"],
+        "m1_trigger": trigger,
+        "m1_ts": last["ts"],
     }
 
 
@@ -406,6 +687,104 @@ def recent_trading_days(n: int, today=None) -> set:
     return set(found)
 
 
+def _attach_mtf(
+    cand: dict[str, Any],
+    info5: dict[str, Any],
+    info1: dict[str, Any],
+    quality: str,
+) -> None:
+    cand["m5_confirm"] = info5["m5_confirm"]
+    cand["m5_high"] = _num(info5["m5_high"])
+    cand["m5_low"] = _num(info5["m5_low"])
+    cand["m5_trigger"] = _num(info5["m5_trigger"])
+    cand["m1_confirm"] = info1["m1_confirm"]
+    cand["m1_high"] = _num(info1["m1_high"])
+    cand["m1_low"] = _num(info1["m1_low"])
+    cand["m1_trigger"] = _num(info1["m1_trigger"])
+    cand["quality"] = quality
+    cand["mtf"] = "M1+M5+M15"
+    cand.setdefault("trigger_tf", "M15")
+
+
+def legacy_m5_confirmation(
+    bar: dict[str, Any],
+    direction: str,
+    m5: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Baseline M5 trigger used for completed M15 decisions.
+
+    The latest M5 inside the M15 must close beyond the bar's midpoint with
+    EMA 9/20 aligned. None means the feed did not cover the bar, which keeps
+    a breakout and drops retest, pullback, and exhaustion. False means a bar
+    was there and failed, which drops every type. This is the test from the
+    +4.71R baseline; the stricter M1 cluster is not applied here.
+    """
+    empty = {
+        "m5_confirm": None,
+        "m5_high": None,
+        "m5_low": None,
+        "m5_trigger": None,
+        "m5_ts": None,
+    }
+    if not m5:
+        return empty
+    start = float(bar["ts"])
+    end = start + M15_SEC
+    inside = [(i, b) for i, b in enumerate(m5) if start - 1 <= b["ts"] < end - 1]
+    if not inside:
+        return empty
+    i, last = inside[-1]
+    closes = [b["close"] for b in m5[: i + 1]]
+    e9 = ema_last(closes, 9)
+    e20 = ema_last(closes, 20)
+    mid = (bar["high"] + bar["low"]) / 2.0
+    if direction == "buy":
+        ok = last["close"] > mid and e9 is not None and e20 is not None and e9 > e20
+        trigger = last["high"]
+    else:
+        ok = last["close"] < mid and e9 is not None and e20 is not None and e9 < e20
+        trigger = last["low"]
+    return {
+        "m5_confirm": bool(ok),
+        "m5_high": last["high"],
+        "m5_low": last["low"],
+        "m5_trigger": trigger,
+        "m5_ts": last["ts"],
+    }
+
+
+def cooldown_type(cand: dict[str, Any]) -> str:
+    """Early breakouts do not share the completed-breakout cooldown.
+
+    A session-open entry can fire before the M15 close and still leave the
+    later completed M15 breakout eligible. Two early alerts on the same
+    symbol still cooldown against each other.
+    """
+    if cand.get("type") == "breakout" and cand.get("trigger_tf") in {"M1", "M5"}:
+        return "breakout_early"
+    return str(cand.get("type") or "")
+
+
+def _annotate_m1(
+    cand: dict[str, Any],
+    m1: list[dict[str, Any]] | None,
+    m5_ts: float | None,
+    level: float | None,
+    wick_frac: float,
+) -> None:
+    """Record M1 timing when the bars exist. Never a reason to drop."""
+    if m1 is None or m5_ts is None:
+        cand["m1_confirm"] = None
+        return
+    info = m1_confirmation(
+        cand["direction"], m1, float(m5_ts), float(m5_ts) + M5_SEC, wick_frac, level=level
+    )
+    cand["m1_confirm"] = info["m1_confirm"]
+    cand["m1_high"] = _num(info["m1_high"])
+    cand["m1_low"] = _num(info["m1_low"])
+    cand["m1_trigger"] = _num(info["m1_trigger"])
+
+
 def _gate_candidates(
     inst: dict[str, Any],
     bar: dict[str, Any],
@@ -413,21 +792,41 @@ def _gate_candidates(
     m5: list[dict[str, Any]] | None,
     sc: dict[str, Any],
     news: tuple[list[dict[str, Any]], bool] | None,
+    m1: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """M5 confirmation for breakout/retest/pullback, then the news window."""
-    require_m5 = bool(sc.get("m5_confirm", True))
+    """Baseline M5 trigger, then the news window. M1 does not veto.
+
+    Breakouts survive a missing M5 feed. Any other type needs M5 confirmation.
+    An M5 bar that disagrees drops every type, including breakouts.
+    """
+    wick_need = float(sc.get("wick_frac") or 0.5)
     gated: list[dict[str, Any]] = []
     for cand in found:
-        if cand["type"] in {"breakout", "retest", "pullback"}:
-            info = m5_confirmation(bar, cand["direction"], m5)
-            cand["m5_confirm"] = info["m5_confirm"]
-            cand["m5_high"] = _num(info["m5_high"])
-            cand["m5_low"] = _num(info["m5_low"])
-            cand["m5_trigger"] = _num(info["m5_trigger"])
-            if info["m5_confirm"] is None:
-                cand["note"] = f"{cand['note']} M5 potrditev ni na voljo".strip()
-            elif require_m5 and not info["m5_confirm"]:
+        info = legacy_m5_confirmation(bar, cand["direction"], m5)
+        cand["m5_confirm"] = info["m5_confirm"]
+        cand["m5_high"] = _num(info["m5_high"])
+        cand["m5_low"] = _num(info["m5_low"])
+        cand["m5_trigger"] = _num(info["m5_trigger"])
+        _annotate_m1(cand, m1, info.get("m5_ts"), cand.get("level"), wick_need)
+        if cand["type"] == "breakout":
+            if info["m5_confirm"] is False:
+                log(f"mtf {inst['symbol']} breakout {cand['direction']} zavrnjen (M5 se ne ujema).")
                 continue
+            cand["quality"] = "A+"
+            cand["mtf"] = "M15+M5" if info["m5_confirm"] is True else "M15"
+            extra = "Kakovost A+."
+            if info["m5_confirm"] is None:
+                extra = "M5 potrditev ni na voljo. " + extra
+            cand["note"] = f"{cand['note']} {extra}".strip()
+            gated.append(cand)
+            continue
+        if info["m5_confirm"] is not True:
+            why = "M5 ni na voljo" if info["m5_confirm"] is None else "M5 se ne ujema"
+            log(f"mtf {inst['symbol']} {cand['type']} {cand['direction']} zavrnjen ({why}).")
+            continue
+        cand["quality"] = "B+"
+        cand["mtf"] = "M15+M5"
+        cand["note"] = f"{cand['note']} M5 potrditev. Kakovost B+.".strip()
         gated.append(cand)
 
     if news is None:
@@ -463,8 +862,14 @@ def evaluate_bar(
     m5: list[dict[str, Any]] | None = None,
     daily: list[dict[str, Any]] | None = None,
     news: tuple[list[dict[str, Any]], bool] | None = None,
+    m1: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return zero or more candidate dicts for m15[idx] (must be completed)."""
+    """Return zero or more candidate dicts for m15[idx] (must be completed).
+
+    M15 structure is necessary and not sufficient. The gate keeps a candidate
+    only when M5 structure and M1 timing agree with it. Callers outside the
+    session-open windows use this on each completed M15 bar.
+    """
     bar = m15[idx]
     today = local_dt(bar["ts"]).date()
     start, _ = day_bounds(today)
@@ -477,7 +882,6 @@ def evaluate_bar(
     closes = [b["close"] for b in m15[: idx + 1]]
     rsi_s = rsi_series(closes, 14)
     rsi = rsi_s[idx]
-    rvol = relative_volume(m15, idx, 20)
     h1_closes = h1_closes_asof(h1, bar["ts"])
     trend = ema_state(h1_closes, 9, 20)
     h1_ema20 = ema_last(h1_closes, 20)
@@ -490,15 +894,9 @@ def evaluate_bar(
     rsi_ob = float(sc.get("rsi_ob") or 75)
     rsi_os = float(sc.get("rsi_os") or 25)
 
-    # Skip RVOL only when the instrument typically has no volume (Yahoo FX, cash DAX).
-    # If the feed usually has volume but this bar does not, do not treat it as a pass.
-    recent = m15[max(0, idx - 40): idx + 1]
-    nz = sum(1 for b in recent if (b.get("volume") or 0) > 0)
-    typically_has_volume = nz >= max(5, int(len(recent) * 0.3))
-    if rvol is None:
-        rvol_ok = not typically_has_volume
-    else:
-        rvol_ok = rvol >= rvol_min
+    # Same RVOL rule as before: threshold rvol_min (1.5), no-volume pass only
+    # when the feed usually has no volume. Do not lower rvol_min here.
+    rvol_ok, rvol = volume_ok(m15, idx, rvol_min)
 
     found: list[dict[str, Any]] = []
 
@@ -519,6 +917,9 @@ def evaluate_bar(
                 "%Y-%m-%dT%H:%M:%SZ"
             ),
             "bar_ts": bar["ts"],
+            "close_ts": bar["ts"] + M15_SEC,
+            "trigger_tf": "M15",
+            "session_open": in_session_open_window(bar["ts"] + M15_SEC, sc),
             "note": note,
             "pwh": _num(pwh),
             "pwl": _num(pwl),
@@ -692,7 +1093,342 @@ def evaluate_bar(
             )
         )
 
-    return _gate_candidates(inst, bar, found, m5, sc, news)
+    return _gate_candidates(inst, bar, found, m5, sc, news, m1=m1)
+
+
+def crossed_level(
+    price: float,
+    level: float | None,
+    side: str,
+    need_buf: bool,
+    buffer: float | None,
+) -> bool:
+    """Price is far enough beyond `level` to count as a break.
+
+    FX, GER40 and WTI use the 0.15× H1 ATR cushion. A missing ATR on those
+    markets does not pass. The cushion is the same one the completed-M15
+    breakout uses; the early path does not shrink it.
+    """
+    if level is None:
+        return False
+    if need_buf:
+        if buffer is None:
+            return False
+        if side == "up":
+            return price >= level + buffer
+        return price <= level - buffer
+    if side == "up":
+        return price > level
+    return price < level
+
+
+def _ohlc(ts: float, parts: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "ts": ts,
+        "open": parts[0]["open"],
+        "high": max(b["high"] for b in parts),
+        "low": min(b["low"] for b in parts),
+        "close": parts[-1]["close"],
+        "volume": sum((b.get("volume") or 0) for b in parts),
+        "complete": False,
+    }
+
+
+def evaluate_early_breakout(
+    inst: dict[str, Any],
+    m15: list[dict[str, Any]],
+    m5: list[dict[str, Any]] | None,
+    m1: list[dict[str, Any]] | None,
+    h1: list[dict[str, Any]],
+    sc: dict[str, Any],
+    decision_ts: float,
+    *,
+    trigger_tf: str = "M5",
+    news: tuple[list[dict[str, Any]], bool] | None = None,
+) -> list[dict[str, Any]]:
+    """Breakout before the M15 bar closes. Session-open windows only.
+
+    Fires only when three views agree at `decision_ts`:
+
+    - forming M15 (built from completed M1 bars) has closed beyond the level
+      by the same cushion a finished M15 breakout would need, and the candle
+      is in the trade direction
+    - the latest completed M5 inside that M15 closed beyond the level by the
+      same cushion, with RVOL >= rvol_min on that M5 bar, plus the usual M5
+      structure (directional close, midpoint, EMA 9/20)
+    - the last five minutes of M1 time the entry (see m1_confirmation)
+
+    Retest, pullback, and exhaustion are not emitted here; they need a
+    finished M15 candle. An M15 boundary is left to evaluate_bar so the same
+    close is not alerted twice. Returns [] outside the boost window, outside
+    active hours, or when any timeframe is missing or disagrees.
+    """
+    if m5 is None or m1 is None or not m15:
+        return []
+    window = in_session_open_window(decision_ts, sc)
+    if window is None:
+        return []
+    if not in_active_hours(
+        decision_ts, sc["active_start"], sc["active_end"], sc.get("weekdays_only", True)
+    ):
+        return []
+    if on_m15_boundary(decision_ts):
+        return []
+
+    period = float(int(decision_ts) - (int(decision_ts) % M15_SEC))
+    m1_asof = sorted(
+        (b for b in m1 if b["ts"] + M1_SEC <= decision_ts + 1),
+        key=lambda b: b["ts"],
+    )
+    m5_asof = sorted(
+        (b for b in m5 if b["ts"] + M5_SEC <= decision_ts + 1),
+        key=lambda b: b["ts"],
+    )
+    parts = [b for b in m1_asof if period - 1 <= b["ts"]]
+    if not parts:
+        return []
+    forming = _ohlc(period, parts)
+    prior = [b for b in m15 if b["ts"] + M15_SEC <= period + 1]
+    if not prior:
+        return []
+    prev_close = prior[-1]["close"]
+
+    today = local_dt(period).date()
+    pdh, pdl, _prev = pdh_pdl(prior, today)
+    asian_s = hm_on_day(today, sc["asian_start"]).timestamp()
+    asian_e = hm_on_day(today, sc["asian_end"]).timestamp()
+    asian_h, asian_l = window_hl(prior, asian_s, asian_e)
+
+    h1_asof = [b for b in h1 if b["ts"] + 3600 <= decision_ts + 1]
+    trend = ema_state([b["close"] for b in h1_asof], 9, 20)
+    if trend not in ("bullish", "bearish"):
+        return []
+    direction = "buy" if trend == "bullish" else "sell"
+    side = "up" if direction == "buy" else "down"
+    if direction == "buy" and not forming["close"] > forming["open"]:
+        return []
+    if direction == "sell" and not forming["close"] < forming["open"]:
+        return []
+
+    h1_atr = atr(h1_asof, 14)
+    atr_mult = float(sc.get("atr_buffer_mult") or 0.15)
+    need_buf = uses_atr_buffer(inst)
+    buffer = (atr_mult * h1_atr) if need_buf and h1_atr and h1_atr > 0 else (None if need_buf else 0.0)
+
+    if direction == "buy":
+        levels = [("PDH", pdh), ("Asian high", asian_h)]
+    else:
+        levels = [("PDL", pdl), ("Asian low", asian_l)]
+
+    inside = [(i, b) for i, b in enumerate(m5_asof) if period - 1 <= b["ts"] < period + M15_SEC - 1]
+    if not inside:
+        return []
+    m5_idx, m5bar = inside[-1]
+
+    chosen: tuple[str, float] | None = None
+    for name, level in levels:
+        if level is None:
+            continue
+        was_inside = prev_close <= level if side == "up" else prev_close >= level
+        if not was_inside:
+            continue
+        if not crossed_level(forming["close"], level, side, need_buf, buffer):
+            continue
+        if not crossed_level(m5bar["close"], level, side, need_buf, buffer):
+            continue
+        chosen = (name, float(level))
+        break
+    if chosen is None:
+        return []
+    level_name, level = chosen
+
+    rvol_min = float(sc.get("rvol_min") or 1.5)
+    rvol_pass, rvol = volume_ok(m5_asof, m5_idx, rvol_min)
+    if not rvol_pass:
+        return []
+
+    wick_need = float(sc.get("wick_frac") or 0.5)
+    info5 = m5_confirmation(
+        forming, direction, m5_asof, level=level, kind="breakout", wick_frac=wick_need
+    )
+    info1 = m1_confirmation(
+        direction, m1_asof, decision_ts - M5_SEC, decision_ts, wick_need, level=level
+    )
+    if info5["m5_confirm"] is not True or info1["m1_confirm"] is not True:
+        log(
+            f"mtf {inst['symbol']} early breakout zavrnjen "
+            f"(M5={info5['m5_confirm']}, M1={info1['m1_confirm']})."
+        )
+        return []
+
+    if news is None:
+        events, ok = load_news_calendar(sc)
+    else:
+        events, ok = news
+    note_extra = ""
+    if not ok:
+        note_extra = " koledar ni na voljo"
+    else:
+        blocked = high_impact_block(inst["symbol"], decision_ts, events, sc)
+        if blocked is not None:
+            log(
+                f"news_block {inst['symbol']} breakout {direction} "
+                f"{blocked.get('title')} {blocked.get('country')} {blocked.get('date')}"
+            )
+            return []
+
+    offset = float(inst.get("offset") or 0)
+    rvol_txt = "M5 RVOL ni na voljo (ni volumna)" if rvol is None else f"M5 RVOL {rvol:.2f}"
+    side_txt = "nad" if direction == "buy" else "pod"
+    if trigger_tf == "M1":
+        bar_ts = decision_ts - M1_SEC
+    else:
+        bar_ts = float(m5bar["ts"])
+    cand = {
+        "symbol": inst["symbol"],
+        "event": "candidate",
+        "type": "breakout",
+        "direction": direction,
+        "level": round(level, 6),
+        "price": forming["close"] - offset,
+        "broker_price": forming["close"],
+        "rvol": None if rvol is None else round(rvol, 2),
+        "rsi": None,
+        "ema_state": trend,
+        "time_utc": datetime.fromtimestamp(decision_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "bar_ts": bar_ts,
+        "close_ts": decision_ts,
+        "trigger_tf": trigger_tf,
+        "session_open": window,
+        "note": (
+            f"Odprtje {window}: M5 zaprl {side_txt} {level_name} {fmt_price(level, inst)}, "
+            f"{rvol_txt} (prag {rvol_min:g}), tekoča M15 je čez raven, "
+            f"H1 EMA 9/20 {trend}. MTF A+: M5 struktura in M1 timing. "
+            f"Zaključena M15 še vedno zahteva RVOL ≥ {rvol_min:g}.{note_extra}"
+        ),
+        "pwh": None,
+        "pwl": None,
+        "dist_pwh": None,
+        "dist_pwl": None,
+        "dist_round": None,
+        "round_level": None,
+    }
+    _attach_mtf(cand, info5, info1, "A+")
+    return [cand]
+
+
+def iter_early_decisions(
+    m5: list[dict[str, Any]] | None,
+    m1: list[dict[str, Any]] | None,
+    cursor_m5: float,
+    cursor_m1: float,
+    now: float,
+    sc: dict[str, Any],
+) -> tuple[list[tuple[float, str]], float, float]:
+    """Completed M1 and M5 closes to evaluate on this loop.
+
+    Outside the session-open windows the cursors advance and the list is
+    empty: M1 is not polled bar-by-bar, and the M15 path still computes
+    confirmation when a 15-minute bar completes. Inside a window, each new
+    M1 or M5 whose close is on a weekday inside 08:00-21:00 becomes one
+    decision. A close that is also an M15 close is skipped here so
+    evaluate_bar owns it. When an M1 and an M5 close together the decision
+    is labeled M5.
+    """
+    events: list[tuple[float, str]] = []
+
+    def consider(
+        bars: list[dict[str, Any]] | None,
+        duration: int,
+        tf: str,
+        cursor: float,
+    ) -> float:
+        if not bars:
+            return cursor
+        new_cursor = cursor
+        for bar in sorted(bars, key=lambda item: item["ts"]):
+            if bar["ts"] <= cursor:
+                continue
+            close_ts = float(bar["ts"]) + duration
+            if close_ts > now + 2:
+                break
+            new_cursor = float(bar["ts"])
+            if on_m15_boundary(close_ts):
+                continue
+            if in_session_open_window(close_ts, sc) is None:
+                continue
+            if not in_active_hours(
+                close_ts, sc["active_start"], sc["active_end"], sc.get("weekdays_only", True)
+            ):
+                continue
+            events.append((close_ts, tf))
+        return new_cursor
+
+    cursor_m5 = consider(m5, M5_SEC, "M5", cursor_m5)
+    cursor_m1 = consider(m1, M1_SEC, "M1", cursor_m1)
+    merged: dict[float, str] = {}
+    for close_ts, tf in events:
+        prev = merged.get(close_ts)
+        if prev is None or tf == "M5":
+            merged[close_ts] = tf
+    decisions = sorted(merged.items())
+    return decisions, cursor_m5, cursor_m1
+
+
+_WEBHOOK_OMIT = {"bar_ts", "close_ts"}
+
+
+def dispatch_candidates(
+    cfg: dict[str, Any],
+    sc: dict[str, Any],
+    state: dict[str, Any],
+    inst: dict[str, Any],
+    cands: list[dict[str, Any]],
+    *,
+    send: bool,
+    now: float,
+) -> list[dict[str, Any]]:
+    """Apply the age limit, cooldown, and daily caps, then optionally send.
+
+    send=False (``--no-send``) still consumes the cap, matching the previous
+    scanner, and does not call the webhook. A failed send does not consume it.
+    """
+    max_age = float(sc.get("max_signal_age_minutes") or 45) * 60.0
+    fired: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for cand in cands:
+        if cand["type"] in seen:
+            continue
+        seen.add(cand["type"])
+        close_ts = float(cand["close_ts"])
+        bar_ts = float(cand["bar_ts"])
+        if (now - close_ts) > max_age:
+            log(
+                f"{inst['symbol']} {cand['type']} {cand['direction']} "
+                f"zamujen (sveča starejša od {int(max_age // 60)} min)."
+            )
+            continue
+        if not can_send(state, inst, cooldown_type(cand), bar_ts, sc):
+            log(
+                f"{inst['symbol']} {cand['type']} {cand['direction']} "
+                f"zavrnjen (cooldown ali dnevni cap)."
+            )
+            continue
+        if send:
+            payload = {k: v for k, v in cand.items() if k not in _WEBHOOK_OMIT}
+            ok, detail = send_webhook(cfg, payload)
+            if detail == SKIPPED_MISSING_SECRETS:
+                continue
+            log(
+                f"WEBHOOK candidate {inst['symbol']} {cand['type']} "
+                f"{cand['direction']} {cand.get('quality')} {cand.get('trigger_tf')} "
+                f"-> {'OK' if ok else 'NAPAKA'}: {detail}"
+            )
+            if not ok:
+                continue
+        mark_sent(state, inst, cooldown_type(cand), bar_ts)
+        fired.append(cand)
+    return fired
 
 
 def day_key(ts: float | None = None) -> str:
@@ -741,22 +1477,39 @@ def _fetch_optional(inst: dict[str, Any], interval: str, range_: str) -> list[di
 
 def fetch_instrument(
     inst: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
+    *,
+    m1_range: str = "1d",
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]] | None,
+    list[dict[str, Any]] | None,
+    list[dict[str, Any]] | None,
+]:
+    """M15, H1, M5, M1, daily. M1 is required for timing; a failed M1 fetch is None.
+
+    Live scans use one day of M1. Backfill asks for 5d so older session bars
+    can still be confirmed. Yahoo serves about a week of 1m; Binance pages
+    further only for the 5d/7d ranges.
+    """
     m15 = completed(fetch_candles(inst, "15m", "1mo"))
     time.sleep(0.15)
     h1 = completed(fetch_candles(inst, "1h", "3mo"))
     time.sleep(0.15)
     m5 = _fetch_optional(inst, "5m", "1mo")
     time.sleep(0.1)
+    m1 = _fetch_optional(inst, "1m", m1_range)
+    time.sleep(0.1)
     daily = _fetch_optional(inst, "1d", "6mo")
-    return m15, h1, m5, daily
+    return m15, h1, m5, m1, daily
 
 
 def backfill(cfg: dict[str, Any], sc: dict[str, Any], days: int = 1) -> list[dict[str, Any]]:
-    """Walk completed M15 bars in the active window and apply caps.
+    """Replay M15 decisions and session-open early breakouts, then apply caps.
 
     `days` is the number of recent weekdays, including today. The default is
-    today only. No webhooks are sent.
+    today only. This never sends a webhook; it only reports what the live
+    rules would have emitted.
     """
     wanted = recent_trading_days(days)
     now = time.time()
@@ -766,10 +1519,12 @@ def backfill(cfg: dict[str, Any], sc: dict[str, Any], days: int = 1) -> list[dic
 
     for inst in sc["universe"]:
         try:
-            m15, h1, m5, daily = fetch_instrument(inst)
+            m15, h1, m5, m1, daily = fetch_instrument(inst, m1_range="5d")
             log(
                 f"backfill {inst['symbol']}: M15={len(m15)} H1={len(h1)} "
-                f"M5={'ni' if m5 is None else len(m5)} D1={'ni' if daily is None else len(daily)}"
+                f"M5={'ni' if m5 is None else len(m5)} "
+                f"M1={'ni' if m1 is None else len(m1)} "
+                f"D1={'ni' if daily is None else len(daily)}"
             )
         except FetchError as exc:
             log(f"backfill {inst['symbol']}: ni podatka ({exc})")
@@ -779,34 +1534,58 @@ def backfill(cfg: dict[str, Any], sc: dict[str, Any], days: int = 1) -> list[dic
             traceback.print_exc()
             continue
         for idx, bar in enumerate(m15):
-            close_ts = bar["ts"] + 15 * 60
+            close_ts = bar["ts"] + M15_SEC
             if close_ts > now + 2:
                 continue
             if local_dt(bar["ts"]).date() not in wanted:
                 continue
             if not in_active_hours(close_ts, sc["active_start"], sc["active_end"], sc["weekdays_only"]):
                 continue
-            cands = evaluate_bar(inst, m15, idx, h1, sc, m5=m5, daily=daily, news=news)
+            cands = evaluate_bar(inst, m15, idx, h1, sc, m5=m5, daily=daily, news=news, m1=m1)
             seen = set()
             for cand in cands:
                 if cand["type"] in seen:
                     continue
                 seen.add(cand["type"])
                 flagged.append(dict(cand))
+        decisions, _c5, _c1 = iter_early_decisions(m5, m1, -1.0, -1.0, now, sc)
+        for decision_ts, trigger_tf in decisions:
+            if local_dt(decision_ts).date() not in wanted:
+                continue
+            for cand in evaluate_early_breakout(
+                inst, m15, m5, m1, h1, sc, decision_ts, trigger_tf=trigger_tf, news=news
+            ):
+                flagged.append(dict(cand))
         time.sleep(0.2)
-    # Apply caps in time order, as a live run from 08:00 would.
-    flagged.sort(key=lambda c: (c.get("bar_ts") or 0, c.get("symbol") or "", c.get("type") or ""))
+    # Close-time order matches a live run: an early breakout at 09:05 is
+    # counted before the 09:15 M15 close, so the cooldown suppresses the echo.
+    flagged.sort(key=lambda c: (c.get("close_ts") or 0, c.get("symbol") or "", c.get("type") or ""))
     applied: list[dict[str, Any]] = []
     for cand in flagged:
         inst = {"id": cand["symbol"], "symbol": cand["symbol"]}
-        if not can_send(fake_state, inst, cand["type"], cand["bar_ts"], sc):
+        if not can_send(fake_state, inst, cooldown_type(cand), cand["bar_ts"], sc):
             cand = dict(cand)
             cand["suppressed"] = True
             applied.append(cand)
             continue
-        mark_sent(fake_state, inst, cand["type"], cand["bar_ts"])
+        mark_sent(fake_state, inst, cooldown_type(cand), cand["bar_ts"])
         applied.append(cand)
     return applied
+
+
+def _seed_cursor(bucket: dict[str, Any], key: str, bars: list[dict[str, Any]] | None) -> bool:
+    """True when this instrument already had a cursor for these bars.
+
+    The first time a feed is seen the cursor jumps to the latest bar and
+    that history is not replayed. Later loops only see bars after it, and
+    dispatch still drops anything older than max_signal_age_minutes.
+    """
+    if not bars:
+        return False
+    if key in bucket:
+        return True
+    bucket[key] = bars[-1]["ts"]
+    return False
 
 
 def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], send: bool = True) -> list[dict[str, Any]]:
@@ -817,11 +1596,15 @@ def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], se
         state["sent_today_by_symbol"] = {}
     fired: list[dict[str, Any]] = []
     last_processed = state.setdefault("last_processed", {})
+    last_m5 = state.setdefault("last_m5", {})
+    last_m1 = state.setdefault("last_m1", {})
     news = load_news_calendar(sc)
+    now = time.time()
+    boost = in_session_open_window(now, sc)
 
     for inst in sc["universe"]:
         try:
-            m15, h1, m5, daily = fetch_instrument(inst)
+            m15, h1, m5, m1, daily = fetch_instrument(inst)
         except FetchError as exc:
             log(f"{inst['symbol']}: ni podatka ({exc})")
             continue
@@ -834,60 +1617,69 @@ def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], se
         newest = m15[-1]
         prev = last_processed.get(inst["id"])
         m5n = "ni" if m5 is None else str(len(m5))
+        m1n = "ni" if m1 is None else str(len(m1))
         # First run: remember the last completed bar and do not back-send it.
         if prev is None:
             last_processed[inst["id"]] = newest["ts"]
+            _seed_cursor(last_m5, inst["id"], m5)
+            _seed_cursor(last_m1, inst["id"], m1)
             log(
                 f"{inst['symbol']} broker={fmt_price(newest['close'], inst)} "
-                f"M15={len(m15)} H1={len(h1)} M5={m5n} (začetno stanje, brez pošiljanja)"
+                f"M15={len(m15)} H1={len(h1)} M5={m5n} M1={m1n} "
+                f"(začetno stanje, brez pošiljanja)"
             )
             continue
         pending = [(i, b) for i, b in enumerate(m15) if b["ts"] > float(prev)]
         pending.sort(key=lambda item: item[1]["ts"])
-        if not pending:
-            continue
-        max_age = float(sc.get("max_signal_age_minutes") or 45) * 60.0
-        now = time.time()
-        for idx, bar in pending:
-            close_ts = bar["ts"] + 15 * 60
+        for _idx, bar in pending:
             last_processed[inst["id"]] = bar["ts"]
-            if not in_active_hours(close_ts, sc["active_start"], sc["active_end"], sc["weekdays_only"]):
-                continue
-            cands = evaluate_bar(inst, m15, idx, h1, sc, m5=m5, daily=daily, news=news)
-            stale = (now - close_ts) > max_age
-            seen = set()
-            for cand in cands:
-                if cand["type"] in seen:
-                    continue
-                seen.add(cand["type"])
-                if stale:
-                    log(
-                        f"{inst['symbol']} {cand['type']} {cand['direction']} "
-                        f"zamujen (sveča starejša od {int(max_age // 60)} min)."
-                    )
-                    continue
-                if not can_send(state, inst, cand["type"], bar["ts"], sc):
-                    log(
-                        f"{inst['symbol']} {cand['type']} {cand['direction']} "
-                        f"zavrnjen (cooldown ali dnevni cap)."
-                    )
-                    continue
-                if send:
-                    ok, detail = send_webhook(cfg, {k: v for k, v in cand.items() if k != "bar_ts"})
-                    if detail == SKIPPED_MISSING_SECRETS:
-                        continue
-                    log(
-                        f"WEBHOOK candidate {inst['symbol']} {cand['type']} "
-                        f"{cand['direction']} -> {'OK' if ok else 'NAPAKA'}: {detail}"
-                    )
-                    if not ok:
-                        continue
-                mark_sent(state, inst, cand["type"], bar["ts"])
-                fired.append(cand)
-        log(
-            f"{inst['symbol']} broker={fmt_price(newest['close'], inst)} "
-            f"M15={len(m15)} H1={len(h1)} M5={m5n}"
-        )
+
+        had_m5 = _seed_cursor(last_m5, inst["id"], m5)
+        had_m1 = _seed_cursor(last_m1, inst["id"], m1)
+        decisions: list[tuple[float, str]] = []
+        # A cursor seeded on this loop means "first sight": do not replay the
+        # M1/M5 history we just anchored. The next loop evaluates new closes.
+        if had_m5 and had_m1:
+            decisions, c5, c1 = iter_early_decisions(
+                m5, m1, float(last_m5[inst["id"]]), float(last_m1[inst["id"]]), now, sc
+            )
+            last_m5[inst["id"]] = c5
+            last_m1[inst["id"]] = c1
+
+        jobs: list[tuple[float, int, str, Any]] = []
+        for idx, bar in pending:
+            close_ts = bar["ts"] + M15_SEC
+            if in_active_hours(close_ts, sc["active_start"], sc["active_end"], sc["weekdays_only"]):
+                jobs.append((close_ts, 0, "m15", idx))
+        for decision_ts, trigger_tf in decisions:
+            jobs.append((decision_ts, 1, "early", trigger_tf))
+        jobs.sort()
+        for _close_ts, _ord, kind, payload in jobs:
+            if kind == "m15":
+                cands = evaluate_bar(
+                    inst, m15, int(payload), h1, sc, m5=m5, daily=daily, news=news, m1=m1
+                )
+            else:
+                cands = evaluate_early_breakout(
+                    inst,
+                    m15,
+                    m5,
+                    m1,
+                    h1,
+                    sc,
+                    float(_close_ts),
+                    trigger_tf=str(payload),
+                    news=news,
+                )
+            fired.extend(
+                dispatch_candidates(cfg, sc, state, inst, cands, send=send, now=now)
+            )
+        if pending or decisions or boost:
+            log(
+                f"{inst['symbol']} broker={fmt_price(newest['close'], inst)} "
+                f"M15={len(m15)} H1={len(h1)} M5={m5n} M1={m1n} "
+                f"odprtje={boost or '-'}"
+            )
         time.sleep(0.2)
     return fired
 
@@ -934,11 +1726,12 @@ def main() -> int:
         )
         for c in flagged:
             flag = "CAP" if c.get("suppressed") else "ALERT"
-            log(
-                f"  {flag} {c['time_utc']} {c['symbol']} {c['type']} {c['direction']} "
-                f"lvl={c['level']} px={c['broker_price']} rvol={c['rvol']} "
-                f"rsi={c['rsi']} ema={c['ema_state']} | {c['note']}"
-            )
+        log(
+            f"  {flag} {c['time_utc']} {c['symbol']} {c['type']} {c['direction']} "
+            f"{c.get('quality')} {c.get('trigger_tf')} "
+            f"lvl={c['level']} px={c['broker_price']} rvol={c['rvol']} "
+            f"rsi={c['rsi']} ema={c['ema_state']} | {c['note']}"
+        )
         report_path = os.path.join(SCRIPT_DIR, "backfill_report.json")
         save_json(report_path, {"flagged": flagged, "would_send": sent_like, "suppressed": suppressed})
         log(f"Poročilo: {report_path}")
@@ -950,9 +1743,12 @@ def main() -> int:
 
     if not (fnlib.webhook_url(cfg) and fnlib.webhook_key(cfg)):
         log("Opozorilo: FN_WEBHOOK_URL ali FN_WEBHOOK_KEY manjka. Pošiljanje bo preskočeno.")
+    windows = ", ".join(f"{name} {start}-{end}" for name, start, end in session_open_windows(sc))
     log(
         f"Scanner zagnan. Instrumentov: {len(sc['universe'])}. "
-        f"Interval: {sc['interval_seconds']} s. "
+        f"Interval: {sc['interval_seconds']} s, "
+        f"ob odprtju {sc.get('boost_interval_seconds', 60)} s ({windows}). "
+        f"MTF: M1+M5+M15, H1 trend. "
         f"Okno {sc['active_start']}-{sc['active_end']} Europe/Ljubljana, delavniki. "
         f"Cap {sc['max_alerts_per_day']}/dan, "
         f"{sc.get('max_alerts_per_symbol_per_day', 2)}/simbol. "
@@ -982,7 +1778,7 @@ def main() -> int:
         if args.once or stop_requested():
             return 0
         elapsed = time.time() - started
-        wait = max(5.0, float(sc.get("interval_seconds") or 300) - elapsed)
+        wait = scanner_sleep_seconds(time.time(), sc, elapsed)
         sleep_secs(wait)
 
 
