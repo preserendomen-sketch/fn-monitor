@@ -3,8 +3,10 @@
 
 Every 5 minutes, on completed M15 candles (H1 for trend), flags a candidate
 only when one of the strict filters holds. Alerts go to the same webhook as
-the order monitor, with event='candidate'. Active 08:00-21:00 Europe/Ljubljana
-on weekdays. Max 12 alerts per day, 2 per symbol; 90-minute cooldown per symbol per type.
+the order monitor, with event='candidate'. The process itself runs all day
+and night so candles stay current. Entry alerts are sent only on weekdays
+from 08:00 to 21:00 Europe/Ljubljana. Max 12 alerts per day, 2 per symbol;
+90-minute cooldown per symbol per type.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ from fnlib import (
 )
 
 STATE_PATH = os.path.join(SCRIPT_DIR, "scanner_state.json")
+HEARTBEAT_PATH = os.path.join(SCRIPT_DIR, "scanner_heartbeat.json")
 
 
 def scanner_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -752,6 +755,82 @@ def fetch_instrument(
     return m15, h1, m5, daily
 
 
+def entry_alert_allowed(close_ts: float, sc: dict[str, Any]) -> bool:
+    """True only for a candle that closed inside the live entry window.
+
+    The scanner keeps reading bars outside this window. It must not send an
+    entry alert for one that closed before 08:00, at or after 21:00, or on
+    a weekend (Europe/Ljubljana).
+    """
+    return in_active_hours(
+        close_ts,
+        sc.get("active_start") or "08:00",
+        sc.get("active_end") or "21:00",
+        bool(sc.get("weekdays_only", True)),
+    )
+
+
+def heartbeat_path() -> str:
+    return HEARTBEAT_PATH
+
+
+def write_heartbeat(
+    sc: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    send_window_open: bool,
+    cycle_ok: bool,
+    last_error: str = "",
+) -> None:
+    """Local liveness file. This never calls the webhook."""
+    last = state.get("last_processed") or {}
+    last_utc: dict[str, str] = {}
+    if isinstance(last, dict):
+        for key, ts in last.items():
+            try:
+                last_utc[str(key)] = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+            except (TypeError, ValueError, OSError):
+                continue
+    payload = {
+        "pid": os.getpid(),
+        "utc": utc_now_iso(),
+        "local": datetime.now(LJ_TZ).isoformat(timespec="seconds"),
+        "unix": time.time(),
+        "mode": "always_on",
+        "send_window_open": bool(send_window_open),
+        "active_start": sc.get("active_start") or "08:00",
+        "active_end": sc.get("active_end") or "21:00",
+        "weekdays_only": bool(sc.get("weekdays_only", True)),
+        "day": state.get("day") or "",
+        "sent_today": int(state.get("sent_today") or 0),
+        "cycle_ok": bool(cycle_ok),
+        "last_error": (last_error or "")[:300],
+        "last_processed_utc": last_utc,
+    }
+    save_json(heartbeat_path(), payload)
+
+
+def note_send_window(sc: dict[str, Any], now: float) -> bool:
+    """Log only when the entry window opens or closes."""
+    open_now = entry_alert_allowed(now, sc)
+    prev = getattr(note_send_window, "was_open", None)
+    if prev is not None and prev != open_now:
+        if open_now:
+            log(
+                f"Okno pošiljanja se je odprlo ({sc['active_start']}-{sc['active_end']} "
+                f"Europe/Ljubljana, delavniki)."
+            )
+        else:
+            log(
+                "Okno pošiljanja se je zaprlo. Sveče se še osvežujejo, "
+                "opozorila se ne pošiljajo."
+            )
+    note_send_window.was_open = open_now
+    return open_now
+
+
 def backfill(cfg: dict[str, Any], sc: dict[str, Any], days: int = 1) -> list[dict[str, Any]]:
     """Walk completed M15 bars in the active window and apply caps.
 
@@ -784,7 +863,7 @@ def backfill(cfg: dict[str, Any], sc: dict[str, Any], days: int = 1) -> list[dic
                 continue
             if local_dt(bar["ts"]).date() not in wanted:
                 continue
-            if not in_active_hours(close_ts, sc["active_start"], sc["active_end"], sc["weekdays_only"]):
+            if not entry_alert_allowed(close_ts, sc):
                 continue
             cands = evaluate_bar(inst, m15, idx, h1, sc, m5=m5, daily=daily, news=news)
             seen = set()
@@ -809,7 +888,21 @@ def backfill(cfg: dict[str, Any], sc: dict[str, Any], days: int = 1) -> list[dic
     return applied
 
 
-def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], send: bool = True) -> list[dict[str, Any]]:
+def scan_live(
+    cfg: dict[str, Any],
+    sc: dict[str, Any],
+    state: dict[str, Any],
+    send: bool = True,
+    now: float | None = None,
+) -> list[dict[str, Any]]:
+    """Advance every new M15 bar. Send an entry alert only inside the window.
+
+    `now` freezes the clock for tests. Production leaves it unset and reads
+    the wall clock once per symbol, after that symbol's candles are fetched.
+    Candles that closed inside the window can still be delivered for
+    max_signal_age_minutes (the existing catch-up). Candles that closed
+    outside the window are marked seen and are not sent.
+    """
     today = day_key()
     if state.get("day") != today:
         state["day"] = today
@@ -817,7 +910,8 @@ def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], se
         state["sent_today_by_symbol"] = {}
     fired: list[dict[str, Any]] = []
     last_processed = state.setdefault("last_processed", {})
-    news = load_news_calendar(sc)
+    # The calendar is only needed when a bar is actually eligible to send.
+    news: tuple[list[dict[str, Any]], bool] | None = None
 
     for inst in sc["universe"]:
         try:
@@ -847,14 +941,18 @@ def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], se
         if not pending:
             continue
         max_age = float(sc.get("max_signal_age_minutes") or 45) * 60.0
-        now = time.time()
+        clock = time.time() if now is None else now
         for idx, bar in pending:
             close_ts = bar["ts"] + 15 * 60
+            # Always advance, including overnight and weekend bars, so the
+            # book is current when the entry window opens again.
             last_processed[inst["id"]] = bar["ts"]
-            if not in_active_hours(close_ts, sc["active_start"], sc["active_end"], sc["weekdays_only"]):
+            if not entry_alert_allowed(close_ts, sc):
                 continue
+            if news is None:
+                news = load_news_calendar(sc)
             cands = evaluate_bar(inst, m15, idx, h1, sc, m5=m5, daily=daily, news=news)
-            stale = (now - close_ts) > max_age
+            stale = (clock - close_ts) > max_age
             seen = set()
             for cand in cands:
                 if cand["type"] in seen:
@@ -865,6 +963,9 @@ def scan_live(cfg: dict[str, Any], sc: dict[str, Any], state: dict[str, Any], se
                         f"{inst['symbol']} {cand['type']} {cand['direction']} "
                         f"zamujen (sveča starejša od {int(max_age // 60)} min)."
                     )
+                    continue
+                # Second gate, immediately before a send is possible.
+                if not entry_alert_allowed(close_ts, sc):
                     continue
                 if not can_send(state, inst, cand["type"], bar["ts"], sc):
                     log(
@@ -950,35 +1051,62 @@ def main() -> int:
 
     if not (fnlib.webhook_url(cfg) and fnlib.webhook_key(cfg)):
         log("Opozorilo: FN_WEBHOOK_URL ali FN_WEBHOOK_KEY manjka. Pošiljanje bo preskočeno.")
+    window_open = entry_alert_allowed(time.time(), sc)
+    note_send_window.was_open = window_open
     log(
-        f"Scanner zagnan. Instrumentov: {len(sc['universe'])}. "
+        f"Scanner zagnan in teče neprekinjeno, tudi ponoči in ob koncu tedna. "
+        f"Opozorila samo ob delavnikih {sc['active_start']}-{sc['active_end']} "
+        f"Europe/Ljubljana. Trenutno okno: {'odprto' if window_open else 'zaprto'}. "
+        f"Instrumentov: {len(sc['universe'])}. "
         f"Interval: {sc['interval_seconds']} s. "
-        f"Okno {sc['active_start']}-{sc['active_end']} Europe/Ljubljana, delavniki. "
         f"Cap {sc['max_alerts_per_day']}/dan, "
         f"{sc.get('max_alerts_per_symbol_per_day', 2)}/simbol. "
         f"cffi={'da' if fnlib._have_curl_cffi() else 'ne'}. "
-        f"Webhook: {'da' if fnlib.webhook_url(cfg) and fnlib.webhook_key(cfg) else 'ne'}."
+        f"Webhook: {'da' if fnlib.webhook_url(cfg) and fnlib.webhook_key(cfg) else 'ne'}. "
+        f"Srčni utrip: {heartbeat_path()}."
     )
 
     while True:
         if stop_requested():
             return 0
         started = time.time()
+        last_error = ""
+        cycle_ok = True
+        window_open = entry_alert_allowed(started, sc)
         try:
             cfg = load_config()
             sc = scanner_cfg(cfg)
+            window_open = note_send_window(sc, started)
             fired = scan_live(cfg, sc, state, send=not args.no_send)
-            if not fired:
+            if not fired and window_open:
                 log("Ni novega kandidata.")
             try:
                 save_json(STATE_PATH, state)
             except OSError as exc:
-                log(f"scanner_state.json se ni shranil: {exc}")
+                last_error = f"scanner_state.json se ni shranil: {exc}"
+                cycle_ok = False
+                log(last_error)
         except SystemExit as exc:
-            log(str(exc))
+            last_error = str(exc)
+            cycle_ok = False
+            log(last_error)
         except Exception as exc:
-            log(f"Krog ni uspel: {exc}")
+            last_error = f"Krog ni uspel: {exc}"
+            cycle_ok = False
+            log(last_error)
             traceback.print_exc()
+        # --once and --backfill must not overwrite the service heartbeat.
+        if not args.once:
+            try:
+                write_heartbeat(
+                    sc,
+                    state,
+                    send_window_open=window_open,
+                    cycle_ok=cycle_ok,
+                    last_error=last_error,
+                )
+            except Exception as exc:
+                log(f"Srčni utrip se ni shranil: {exc}")
         if args.once or stop_requested():
             return 0
         elapsed = time.time() - started

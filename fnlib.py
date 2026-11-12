@@ -73,6 +73,8 @@ def load_config() -> dict[str, Any]:
     cfg.setdefault("key_prefix", "Bearer ")
     cfg.setdefault("webhook_url_env", "FN_WEBHOOK_URL")
     cfg.setdefault("webhook_key_env", "FN_WEBHOOK_KEY")
+    cfg.setdefault("health_webhook_url_env", "FN_HEALTH_WEBHOOK_URL")
+    cfg.setdefault("health_webhook_key_env", "FN_HEALTH_WEBHOOK_KEY")
     cfg.setdefault("poll_seconds", 60)
     cfg.setdefault("cooldown_seconds", 600)
     return cfg
@@ -97,6 +99,24 @@ def webhook_url(cfg: dict[str, Any]) -> str:
     The value in config.json is ignored so a secret cannot be committed.
     """
     return _env_value(cfg, "webhook_url_env", "FN_WEBHOOK_URL")
+
+
+def health_webhook_key(cfg: dict[str, Any]) -> str:
+    """Key from FN_HEALTH_WEBHOOK_KEY. Never log the return value.
+
+    config.json stores the environment variable name only. Empty means the
+    health webhook is off. A missing key must not fall back to FN_WEBHOOK_KEY.
+    """
+    return _env_value(cfg, "health_webhook_key_env", "FN_HEALTH_WEBHOOK_KEY")
+
+
+def health_webhook_url(cfg: dict[str, Any]) -> str:
+    """URL from FN_HEALTH_WEBHOOK_URL. Never log the return value.
+
+    config.json stores the environment variable name only. Empty means the
+    health webhook is off. A missing URL must not fall back to FN_WEBHOOK_URL.
+    """
+    return _env_value(cfg, "health_webhook_url_env", "FN_HEALTH_WEBHOOK_URL")
 
 
 def webhook_is_placeholder(url: str) -> bool:
