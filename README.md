@@ -7,7 +7,7 @@ Monitor čakajočih nalogov in skener priložnosti, ki tečeta na GitHub Actions
 - **Monitor** (`monitor.py`) vsakih 60 sekund preveri čakajoče naloge in pošlje webhook ob dogodkih `near_entry`, `triggered`, `m15_close_against`, `near_sl`, `sl_hit`, `tp_hit` in `halfway_to_tp`.
 - **Skener** (`scanner.py`) vsakih 5 minut pregleda deset simbolov (EURUSD, GBPUSD, AUDUSD, USDJPY, XAUUSD, USOUSD, BTCUSD, NAS100, GER40, US30) in javi kandidate `breakout`, `retest` in `exhaustion`. USOUSD je surova nafta WTI.
 - Oba tečeta v istem zagonu približno 28 minut. Razpored je na vsakih 15 minut ob delavnikih, od 06:00 do 20:45 UTC (pozimi približno 07:00–21:45 po času Europe/Ljubljana, poleti uro pozneje). Tek, ki že teče, se ne prekine. Če GitHub zamudi, skener ob naslednjem zagonu še pošlje sveče, ki so se zaprle v zadnjih 45 minutah; starejše samo zapiše kot `zamujen`.
-- Stanje (že poslani dogodki, cooldowni, dnevne omejitve) se med zagoni shrani v predpomnilnik Actions, da se isto opozorilo ne pošlje dvakrat. Skener sme na dan poslati največ **2 kandidata na simbol** in **8 skupaj**.
+- Stanje (že poslani dogodki, cooldowni, dnevne omejitve) se med zagoni shrani v predpomnilnik Actions, da se isto opozorilo ne pošlje dvakrat. Skener sme na dan poslati največ **2 kandidata na simbol** in **12 skupaj**.
 - BTCUSD je samo v skenerju. Med nalogi ga ni, ker ga je posrednik zavrnil.
 
 Cene za Yahoo Finance se najprej prenesejo s `curl_cffi` (posnemanje brskalnika Chrome). Če Yahoo zavrne IP GitHubovega tekača, sledi navaden `urllib`, nato še `query2.finance.yahoo.com`. BTC pride z Binance; če je `api.binance.com` blokiran, se uporabi `data-api.binance.vision`.

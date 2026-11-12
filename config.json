@@ -15,7 +15,7 @@
     "asian_start": "00:00",
     "asian_end": "08:00",
     "cooldown_minutes": 90,
-    "max_alerts_per_day": 8,
+    "max_alerts_per_day": 12,
     "rvol_min": 1.5,
     "rsi_ob": 75,
     "rsi_os": 25,
