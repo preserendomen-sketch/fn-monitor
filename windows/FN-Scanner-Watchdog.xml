@@ -3,13 +3,13 @@
   <RegistrationInfo>
     <URI>\FN Scanner Watchdog</URI>
     <Author>fn-monitor</Author>
-    <Description>Restarts FN Scanner when the process is gone or scanner_heartbeat.json is stale. Does not send webhooks.</Description>
+    <Description>Every minute, restarts FN Scanner when the process is gone or scanner_heartbeat.json is stale. health.py sends a webhook only after a failed or successful restart, and only when configured. A disabled task stays disabled.</Description>
   </RegistrationInfo>
   <Triggers>
     <BootTrigger>
       <Enabled>true</Enabled>
       <Repetition>
-        <Interval>PT5M</Interval>
+        <Interval>PT1M</Interval>
         <Duration>P1D</Duration>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
@@ -19,7 +19,7 @@
       <StartBoundary>2026-01-01T00:00:00</StartBoundary>
       <Enabled>true</Enabled>
       <Repetition>
-        <Interval>PT5M</Interval>
+        <Interval>PT1M</Interval>
         <Duration>P1D</Duration>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
@@ -51,17 +51,17 @@
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT4M</ExecutionTimeLimit>
+    <ExecutionTimeLimit>PT2M</ExecutionTimeLimit>
     <Priority>7</Priority>
     <RestartOnFailure>
-      <Interval>PT5M</Interval>
+      <Interval>PT1M</Interval>
       <Count>3</Count>
     </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
     <Exec>
       <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
-      <Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "__INSTALL_DIR__\windows\watchdog.ps1" -InstallDir "__INSTALL_DIR__" -TaskName "FN Scanner"</Arguments>
+      <Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "__INSTALL_DIR__\windows\watchdog.ps1" -InstallDir "__INSTALL_DIR__" -TaskName "FN Scanner" -StaleMinutes 12</Arguments>
       <WorkingDirectory>__INSTALL_DIR__</WorkingDirectory>
     </Exec>
   </Actions>

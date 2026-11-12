@@ -95,7 +95,7 @@ class SendWindowTest(unittest.TestCase):
         self.assertEqual(self.urlopen.call_count, 0)
         self.assertEqual(self.http.call_count, 0)
 
-    def _scan(self, closes, now, *, send=True, prev=None, gate=None):
+    def _scan(self, closes, now, *, send=True, prev=None, gate=None, sent_today=0, sent_by=None, day=None):
         bars = [candle(close) for close in closes]
         bars.sort(key=lambda bar: bar["ts"])
         if prev is None:
@@ -110,9 +110,9 @@ class SendWindowTest(unittest.TestCase):
         sc = live_rules()
         sc["universe"] = [inst]
         state = {
-            "day": datetime.now(LJ_TZ).strftime("%Y-%m-%d"),
-            "sent_today": 0,
-            "sent_today_by_symbol": {},
+            "day": day or datetime.now(LJ_TZ).strftime("%Y-%m-%d"),
+            "sent_today": sent_today,
+            "sent_today_by_symbol": dict(sent_by or {}),
             "last": {},
             "last_processed": {inst["id"]: prev},
         }
@@ -449,6 +449,71 @@ class SendWindowTest(unittest.TestCase):
         self.assertEqual(sc["max_alerts_per_day"], 12)
         self.assertEqual(sc["max_alerts_per_symbol_per_day"], 2)
         self.assertEqual(sc["rvol_min"], 1.5)
+        self.assertEqual(sc["interval_seconds"], 300)
+        self.assertEqual(
+            [row["symbol"] for row in sc["universe"]],
+            [
+                "EURUSD",
+                "GBPUSD",
+                "AUDUSD",
+                "USDJPY",
+                "XAUUSD",
+                "USOUSD",
+                "BTCUSD",
+                "NAS100",
+                "GER40",
+                "US30",
+            ],
+        )
+
+    def test_caps_and_cooldown_stay_at_12_2_and_90(self) -> None:
+        sc = live_rules()
+        thursday = first_weekday(2026, 11, 3)
+        ts = at_local(thursday, 10, 0).timestamp()
+        day = scanner.day_key(ts)
+        eurusd = {"id": "EURUSD", "symbol": "EURUSD"}
+        gbpusd = {"id": "GBPUSD", "symbol": "GBPUSD"}
+        state = {"day": day, "sent_today": 0, "sent_today_by_symbol": {}, "last": {}}
+        self.assertTrue(scanner.can_send(state, eurusd, "breakout", ts, sc))
+        scanner.mark_sent(state, eurusd, "breakout", ts)
+        self.assertFalse(scanner.can_send(state, eurusd, "breakout", ts + 89 * 60, sc))
+        self.assertTrue(scanner.can_send(state, eurusd, "breakout", ts + 90 * 60, sc))
+        self.assertTrue(scanner.can_send(state, eurusd, "retest", ts, sc))
+        scanner.mark_sent(state, eurusd, "retest", ts)
+        self.assertEqual(state["sent_today"], 2)
+        self.assertEqual(state["sent_today_by_symbol"]["EURUSD"], 2)
+        self.assertFalse(scanner.can_send(state, eurusd, "exhaustion", ts + 90 * 60, sc))
+        self.assertTrue(scanner.can_send(state, gbpusd, "breakout", ts, sc))
+        capped = {"day": day, "sent_today": 12, "sent_today_by_symbol": {}, "last": {}}
+        self.assertFalse(scanner.can_send(capped, gbpusd, "breakout", ts, sc))
+        almost = {"day": day, "sent_today": 11, "sent_today_by_symbol": {"GBPUSD": 1}, "last": {}}
+        self.assertTrue(scanner.can_send(almost, gbpusd, "breakout", ts, sc))
+
+    def test_scan_live_stops_at_the_daily_and_symbol_caps(self) -> None:
+        thursday = first_weekday(2026, 11, 3)
+        close = at_local(thursday, 10, 0)
+        fixed = scanner.day_key(close.timestamp())
+        with patch("scanner.day_key", return_value=fixed):
+            sent, state, _evaluated, _news, fired = self._scan(
+                [close],
+                close + timedelta(minutes=1),
+                sent_today=12,
+                day=fixed,
+            )
+        self.assertEqual(sent, [])
+        self.assertEqual(fired, [])
+        self.assertEqual(state["sent_today"], 12)
+        with patch("scanner.day_key", return_value=fixed):
+            sent, state, _evaluated, _news, fired = self._scan(
+                [close],
+                close + timedelta(minutes=1),
+                sent_today=1,
+                sent_by={"BTCUSD": 2},
+                day=fixed,
+            )
+        self.assertEqual(sent, [])
+        self.assertEqual(fired, [])
+        self.assertEqual(state["sent_today_by_symbol"]["BTCUSD"], 2)
 
 
 class WindowsAlwaysOnTest(unittest.TestCase):
@@ -502,23 +567,29 @@ class WindowsAlwaysOnTest(unittest.TestCase):
         self.assertNotIn("FN_WEBHOOK", text)
         self.assertNotIn("https://", text)
 
-    def test_watchdog_task_repeats_and_does_not_send(self) -> None:
+    def test_watchdog_task_checks_every_minute(self) -> None:
         path = WINDOWS / "FN-Scanner-Watchdog.xml"
         root = ET.parse(path).getroot()
         text = path.read_text(encoding="utf-8")
         self.assertIsNotNone(root.find("t:Triggers/t:BootTrigger", TASK_NS))
-        self.assertIn("PT5M", text)
+        self.assertIsNotNone(root.find("t:Triggers/t:CalendarTrigger", TASK_NS))
+        intervals = [el.text for el in root.findall(".//t:Interval", TASK_NS)]
+        self.assertTrue(intervals)
+        self.assertTrue(all(item == "PT1M" for item in intervals))
+        self.assertNotIn("PT5M", text)
         self.assertIn("watchdog.ps1", text)
         self.assertIn("powershell.exe", text)
+        self.assertIn("-StaleMinutes 12", text)
         self.assertEqual(
             root.findtext("t:Settings/t:ExecutionTimeLimit", namespaces=TASK_NS),
-            "PT4M",
+            "PT2M",
         )
         self.assertEqual(
             root.findtext("t:Principals/t:Principal/t:LogonType", namespaces=TASK_NS),
             "Password",
         )
         self.assertNotIn("FN_WEBHOOK", text)
+        self.assertNotIn("FN_HEALTH", text)
         self.assertNotIn("https://", text)
 
     def test_starter_uses_the_venv_python(self) -> None:

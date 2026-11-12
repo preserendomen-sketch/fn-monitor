@@ -1,6 +1,8 @@
 {
   "webhook_url_env": "FN_WEBHOOK_URL",
   "webhook_key_env": "FN_WEBHOOK_KEY",
+  "health_webhook_url_env": "FN_HEALTH_WEBHOOK_URL",
+  "health_webhook_key_env": "FN_HEALTH_WEBHOOK_KEY",
   "key_header": "Authorization",
   "key_prefix": "Bearer ",
   "poll_seconds": 60,

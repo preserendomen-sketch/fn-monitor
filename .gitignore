@@ -6,6 +6,7 @@ state.json
 scanner_state.json
 scanner_heartbeat.json
 watchdog_heartbeat.json
+watchdog_notify.json
 backfill_report.json
 logs/
 *.tmp

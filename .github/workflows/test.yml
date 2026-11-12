@@ -22,4 +22,4 @@ jobs:
           python-version: "3.12"
 
       - name: Preveri okno pošiljanja
-        run: python -m unittest test_send_window.py -v
+        run: python -m unittest test_send_window.py test_health.py -v
