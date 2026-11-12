@@ -4,5 +4,8 @@ __pycache__/
 venv/
 state.json
 scanner_state.json
+scanner_heartbeat.json
+watchdog_heartbeat.json
 backfill_report.json
+logs/
 *.tmp

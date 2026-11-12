@@ -1,0 +1,25 @@
+name: Tests
+
+# Unit tests only. No secrets, no scanner loop, no webhook.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  send-window:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Preveri okno pošiljanja
+        run: python -m unittest test_send_window.py -v
