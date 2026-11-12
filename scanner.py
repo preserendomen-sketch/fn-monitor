@@ -4,7 +4,7 @@
 Every 5 minutes, on completed M15 candles (H1 for trend), flags a candidate
 only when one of the strict filters holds. Alerts go to the same webhook as
 the order monitor, with event='candidate'. Active 08:00-21:00 Europe/Ljubljana
-on weekdays. Max 8 alerts per day, 2 per symbol; 90-minute cooldown per symbol per type.
+on weekdays. Max 12 alerts per day, 2 per symbol; 90-minute cooldown per symbol per type.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def scanner_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
     sc.setdefault("asian_start", "00:00")
     sc.setdefault("asian_end", "08:00")
     sc.setdefault("cooldown_minutes", 90)
-    sc.setdefault("max_alerts_per_day", 8)
+    sc.setdefault("max_alerts_per_day", 12)
     sc.setdefault("max_alerts_per_symbol_per_day", 2)
     sc.setdefault("atr_buffer_mult", 0.15)
     sc.setdefault("rvol_min", 1.5)
