@@ -8,9 +8,8 @@ name: Monitor
 # newest waiting run starts when it exits. An intermediate queued run can be
 # replaced, but the 28-minute job already covers that slot. If GitHub starts
 # a cron late, the scanner still emits M15 signals that closed within 45 minutes.
+# VPS scanner is primary since 16.11.2026.
 on:
-  schedule:
-    - cron: "*/15 6-20 * * 1-5"
   workflow_dispatch:
     inputs:
       duration_minutes:
